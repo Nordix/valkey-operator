@@ -53,6 +53,7 @@ var scripts embed.FS
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -79,6 +80,17 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.upsertDeployments(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// Get all pods and their current Valkey Cluster state
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(cluster.Namespace), client.MatchingLabels(labels(cluster))); err != nil {
+		log.Error(err, "Failed to list pods")
+		return ctrl.Result{}, err
+	}
+	state := r.getValkeyClusterState(ctx, cluster, pods)
+	defer state.CloseClients()
+
+	//log.V(1).Info("Current Valkey state", "state", state)
 
 	log.V(1).Info("Reconcile done")
 	return ctrl.Result{}, nil
@@ -182,6 +194,20 @@ func (r *ValkeyClusterReconciler) upsertDeployments(ctx context.Context, cluster
 	// TODO: update existing
 
 	return nil
+}
+
+func (r *ValkeyClusterReconciler) getValkeyClusterState(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, pods *corev1.PodList) *valkey.ClusterState {
+	// Create a list of addresses to possible Valkey nodes
+	ips := []string{}
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP == "" {
+			continue
+		}
+		ips = append(ips, pod.Status.PodIP)
+	}
+
+	// Get current state of the Valkey cluster
+	return valkey.GetClusterState(ctx, ips, DefaultPort)
 }
 
 // SetupWithManager sets up the controller with the Manager.
