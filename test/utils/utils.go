@@ -295,6 +295,14 @@ func GetEvents(resourceName string) (map[string]bool, map[string]bool, error) {
 // GetReplicaDeployment finds a deployment that is running a replica instance
 // by checking the logs of its pods for the ":S" role indicator.
 func GetReplicaDeployment(selector string) (string, error) {
+	return getDeploymentType(selector, "S")
+}
+
+func GetPrimaryDeployment(selector string) (string, error) {
+	return getDeploymentType(selector, "M")
+}
+
+func getDeploymentType(selector, role string) (string, error) {
 	// List pods matching the selector
 	cmd := exec.Command("kubectl", "get", "pods", "-l", selector, "-o", "jsonpath={.items[*].metadata.name}")
 	output, err := Run(cmd)
@@ -320,9 +328,9 @@ func GetReplicaDeployment(selector string) (string, error) {
 		for i := len(lines) - 1; i >= 0; i-- {
 			matches := rolePattern.FindStringSubmatch(lines[i])
 			if len(matches) > 1 {
-				role := matches[1]
-				if role == "S" {
-					// Found a replica pod, now find its deployment.
+				foundRole := matches[1]
+				if foundRole == role {
+					// Found a pod with correct role, now find its deployment.
 					// 1. Get ReplicaSet owner of the pod
 					cmd = exec.Command("kubectl", "get", "pod", podName, "-o", "jsonpath={.metadata.ownerReferences[0].name}")
 					rsName, err := Run(cmd)
@@ -339,13 +347,13 @@ func GetReplicaDeployment(selector string) (string, error) {
 
 					return deployName, nil
 				}
-				// If role is "M", it's a master, so this pod is not a replica. Stop checking this pod.
+				// Try next pod
 				break
 			}
 		}
 	}
 
-	return "", fmt.Errorf("no replica deployment found with selector %q", selector)
+	return "", fmt.Errorf("no deployment found with selector %q", selector)
 }
 
 // CollectDebugInfo collects debugging information including controller logs,

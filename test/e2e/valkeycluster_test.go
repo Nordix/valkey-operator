@@ -356,8 +356,11 @@ spec:
 				// with master deployment deletion resulting in cluster not being able to recover
 				// https://github.com/valkey-io/valkey-operator/issues/43
 				var err error
-				deploymentToDelete, err = utils.GetReplicaDeployment(fmt.Sprintf("app.kubernetes.io/instance=%s", degradedClusterName))
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to find a replica deployment")
+				//deploymentToDelete, err = utils.GetReplicaDeployment(fmt.Sprintf("app.kubernetes.io/instance=%s", degradedClusterName))
+				//g.Expect(err).NotTo(HaveOccurred(), "Failed to find a replica deployment")
+
+				deploymentToDelete, err = utils.GetPrimaryDeployment(fmt.Sprintf("app.kubernetes.io/instance=%s", degradedClusterName))
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to find a primary deployment")
 				g.Expect(deploymentToDelete).NotTo(BeEmpty())
 			}
 			Eventually(getDeployment).Should(Succeed())
