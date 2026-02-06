@@ -404,4 +404,25 @@ func CollectDebugInfo(namespace string) {
 	} else {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
 	}
+
+	// Get managed Valkey pod names
+	cmd = exec.Command("kubectl", "get", "pods", "-l", "app.kubernetes.io/managed-by=valkey-operator",
+		"-o", "jsonpath={.items[*].metadata.name}", "-n", namespace)
+	output, err := Run(cmd)
+	if err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "failed to list pods: %s", err)
+	}
+	podNames := strings.Fields(output)
+
+	By("Fetching Valkey pod logs")
+	for _, podName := range podNames {
+		// Get logs (last 100 lines only)
+		cmd = exec.Command("kubectl", "logs", podName, "--tail=100")
+		logs, err := Run(cmd)
+		if err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "[%s] failed to get log: %s", podName, err)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "[%s]:\n%s", podName, logs)
+		}
+	}
 }
