@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strconv"
@@ -414,7 +415,8 @@ func (r *ValkeyClusterReconciler) forgetStaleNodes(ctx context.Context, cluster 
 					// Could not find a pod with the address of a failing node. Lets forget this node.
 					log.V(1).Info("forget a failing node", "address", failing.Address, "Id", failing.Id)
 					if err := node.Client.Do(ctx, node.Client.B().ClusterForget().NodeId(failing.Id).Build()).Error(); err != nil {
-						log.Error(err, "command failed: CLUSTER FORGET")
+						jstate, err := json.Marshal(state)
+						log.Error(err, "command failed: CLUSTER FORGET", "state", string(jstate))
 						r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "NodeForgetFailed", "ForgetNode", "Failed to forget node: %v", err)
 					} else {
 						r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "StaleNodeForgotten", "ForgetNode", "Forgot stale node %v", failing.Address)
