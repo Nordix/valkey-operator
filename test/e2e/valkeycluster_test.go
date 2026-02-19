@@ -44,6 +44,8 @@ var _ = Describe("ValkeyCluster", Ordered, func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
 			utils.CollectDebugInfo(namespace)
+			// All tests currently deploys to the default namespace.
+			utils.CollectValkeyLogs("default")
 		}
 	})
 
@@ -572,6 +574,7 @@ spec:
 		// as a replica of the promoted primary instead of trying to claim slots.
 		It("should detect and recover when a primary deployment is deleted", func() {
 			By("creating a ValkeyCluster")
+			failoverClusterName := "valkeycluster-failover-test"
 			failoverClusterManifest := `apiVersion: valkey.io/v1alpha1
 kind: ValkeyCluster
 metadata:
@@ -586,18 +589,15 @@ spec:
 			Expect(err).NotTo(HaveOccurred(), "Failed to write manifest file")
 			defer os.Remove(manifestFile)
 
-			failoverClusterName := "valkeycluster-failover-test"
-			defer func() {
-				cmd := exec.Command("kubectl", "delete", "valkeycluster", failoverClusterName, "--ignore-not-found=true", "--wait=false")
-				_, _ = utils.Run(cmd)
-			}()
-
 			By("applying the CR")
-			cmd := exec.Command("kubectl", "delete", "valkeycluster", failoverClusterName, "--ignore-not-found=true")
-			_, _ = utils.Run(cmd)
-			cmd = exec.Command("kubectl", "create", "-f", manifestFile)
+			cmd := exec.Command("kubectl", "create", "-f", manifestFile)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create ValkeyCluster CR")
+
+			DeferCleanup(func() {
+				cmd := exec.Command("kubectl", "delete", "valkeycluster", failoverClusterName, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			})
 
 			By("waiting for cluster to become ready")
 			verifyClusterReady := func(g Gomega) {
