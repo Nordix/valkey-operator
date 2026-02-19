@@ -41,6 +41,8 @@ var _ = Describe("ValkeyCluster", Ordered, func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
 			utils.CollectDebugInfo(namespace)
+			// All tests currently deploys to the default namespace.
+			utils.CollectValkeyLogs("default")
 		}
 	})
 
