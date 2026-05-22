@@ -2,8 +2,8 @@ name: E2E Tests
 
 on:
   push:
-    branches:
-      - 'main'
+    # branches:
+    #   - 'main'
   pull_request:
 
 jobs:
@@ -28,7 +28,13 @@ jobs:
       - name: Verify kind installation
         run: kind version
 
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker system prune -af
+
       - name: Running Test e2e
         run: |
           go mod tidy
-          make test-e2e
+          make test-e2e-repeat TEST_FOCUS="creates a Valkey Cluster deployment" TEST_REPEAT=99
+          # make test-e2e-repeat TEST_FOCUS="creates a functioning cluster backed by Deployments" TEST_REPEAT=99

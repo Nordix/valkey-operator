@@ -560,13 +560,19 @@ func buildClusterValkeyNode(cluster *valkeyiov1alpha1.ValkeyCluster, shardIndex 
 }
 
 func (r *ValkeyClusterReconciler) getValkeyClusterState(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, nodes *valkeyiov1alpha1.ValkeyNodeList, username, password string) *valkey.ClusterState {
+	log := logf.FromContext(ctx)
 	ips := []string{}
+	var nodesSummary []string
 	for _, node := range nodes.Items {
+		shardIdx := node.Labels[LabelShardIndex]
+		nodeIdx := node.Labels[LabelNodeIndex]
+		nodesSummary = append(nodesSummary, fmt.Sprintf("%s(shard=%s,node=%s,ip=%s)", node.Name, shardIdx, nodeIdx, node.Status.PodIP))
 		if node.Status.PodIP == "" {
 			continue
 		}
 		ips = append(ips, node.Status.PodIP)
 	}
+	log.V(1).Info("ValkeyNodes state", "nodes", nodesSummary)
 	var tlsConfig *tls.Config
 	if cluster.Spec.TLS != nil && cluster.Spec.TLS.Certificate.SecretName != "" {
 		serverName := fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace)
@@ -620,10 +626,14 @@ func (r *ValkeyClusterReconciler) meetIsolatedNodes(ctx context.Context, cluster
 
 	var isolated []*valkey.NodeState
 	for _, node := range state.PendingNodes {
-		if node.IsIsolated() {
+		knownNodes := node.ClusterInfo["cluster_known_nodes"]
+		isIsolated := node.IsIsolated()
+		log.V(1).Info("checking node isolation", "address", node.Address, "cluster_known_nodes", knownNodes, "isIsolated", isIsolated)
+		if isIsolated {
 			isolated = append(isolated, node)
 		}
 	}
+	log.Info("meetIsolatedNodes summary", "pendingNodes", len(state.PendingNodes), "isolatedNodes", len(isolated))
 	if len(isolated) == 0 {
 		return 0, nil
 	}
@@ -683,6 +693,7 @@ func (r *ValkeyClusterReconciler) assignSlotsToPendingPrimaries(ctx context.Cont
 	primaries := make([]*valkey.NodeState, 0, len(state.PendingNodes))
 	for _, node := range state.PendingNodes {
 		if node.IsIsolated() && !isSingleNodeCluster {
+			log.V(1).Info("skipping isolated pending node", "address", node.Address, "nodeId", node.Id)
 			continue
 		}
 		role, shardIndex := nodeRoleAndShard(node.Address, nodes)
@@ -701,6 +712,21 @@ func (r *ValkeyClusterReconciler) assignSlotsToPendingPrimaries(ctx context.Cont
 	}
 
 	slots := state.GetUnassignedSlots()
+
+	// Log current shard slot assignments for debugging
+	for i, shard := range state.Shards {
+		log.V(1).Info("existing shard slots",
+			"shardIndex", i,
+			"shardId", shard.Id,
+			"primaryId", shard.PrimaryId,
+			"slots", shard.Slots)
+	}
+	log.V(1).Info("slot assignment state",
+		"unassignedSlots", slots,
+		"numPendingPrimaries", len(primaries),
+		"shardsRequired", shardsRequired,
+		"shardsExist", len(state.Shards))
+
 	if len(slots) == 0 {
 		// Scale-out: all slots already assigned to existing primaries.
 		// New primaries stay in PendingNodes; the rebalancer will find
@@ -726,12 +752,31 @@ func (r *ValkeyClusterReconciler) assignSlotsToPendingPrimaries(ctx context.Cont
 		}
 		slotEnd := slotStart + numSlotsPerShard - 1
 
-		log.V(1).Info("assign slots to primary", "node", node.Address, "slotStart", slotStart, "slotEnd", slotEnd)
+		log.Info("assign slots to primary",
+			"node", node.Address,
+			"nodeId", node.Id,
+			"shardIdx", shardIdx,
+			"shardsExists", shardsExists,
+			"shardsRequired", shardsRequired,
+			"numSlotsPerShard", numSlotsPerShard,
+			"slotStart", slotStart,
+			"slotEnd", slotEnd,
+			"unassignedSlots", slots)
 		if err := node.Client.Do(ctx, node.Client.B().ClusterAddslotsrange().StartSlotEndSlot().StartSlotEndSlot(int64(slotStart), int64(slotEnd)).Build()).Error(); err != nil {
-			log.Error(err, "CLUSTER ADDSLOTSRANGE failed", "node", node.Address, "slotStart", slotStart, "slotEnd", slotEnd)
+			log.Error(err, "CLUSTER ADDSLOTSRANGE failed",
+				"node", node.Address,
+				"nodeId", node.Id,
+				"slotStart", slotStart,
+				"slotEnd", slotEnd,
+				"nodeClusterNodes", node.ClusterNodes)
 			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "SlotAssignmentFailed", "AssignSlots", "Failed to assign slots %d-%d to %v: %v", slotStart, slotEnd, node.Address, err)
 			return assigned, err
 		}
+		log.Info("slots assigned successfully",
+			"node", node.Address,
+			"nodeId", node.Id,
+			"slotStart", slotStart,
+			"slotEnd", slotEnd)
 		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "PrimaryCreated", "CreatePrimary", "Created primary %v with slots %d-%d", node.Address, slotStart, slotEnd)
 		assigned++
 
@@ -808,7 +853,7 @@ func (r *ValkeyClusterReconciler) replicateToShardPrimary(ctx context.Context, c
 	// against the live Valkey topology. This handles both the normal case
 	// (node-index=0 is the primary) and the post-failover case (a promoted
 	// replica is the primary).
-	primaryNodeId, primaryIP := findShardPrimary(state, shardIndex, nodes)
+	primaryNodeId, primaryIP := findShardPrimaryDebug(state, shardIndex, nodes, log)
 	if primaryNodeId == "" {
 		return fmt.Errorf("shard %d: %w", shardIndex, errPrimaryNotReady)
 	}
@@ -847,9 +892,10 @@ func (r *ValkeyClusterReconciler) forgetStaleNodes(ctx context.Context, cluster 
 				// remove it from their node tables and prevent them from
 				// voting in the auto-failover election, permanently
 				// blocking the replica's promotion.
-				if state.HasReplicaOf(failing.Id) {
+				replicaAddr := state.FindReplicaOf(failing.Id)
+				if replicaAddr != "" {
 					log.V(1).Info("skipping forget; failover pending for node",
-						"address", failing.Address, "Id", failing.Id)
+						"address", failing.Address, "Id", failing.Id, "replicaOf", replicaAddr)
 					continue
 				}
 				log.V(1).Info("forget a failing node", "address", failing.Address, "Id", failing.Id)

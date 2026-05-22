@@ -72,6 +72,10 @@ var _ = BeforeSuite(func() {
 	_, err := utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to purge old events")
 
+	By("pruning Docker to free disk space")
+	cmd = exec.Command("docker", "system", "prune", "-af")
+	_, _ = utils.Run(cmd)
+
 	By("building the manager image")
 	cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
 	_, err = utils.Run(cmd)
@@ -135,6 +139,10 @@ var _ = AfterSuite(func() {
 
 	By("removing manager namespace")
 	cmd = exec.Command("kubectl", "delete", "ns", namespace)
+	_, _ = utils.Run(cmd)
+
+	By("pruning Docker to free disk space")
+	cmd = exec.Command("docker", "system", "prune", "-af")
 	_, _ = utils.Run(cmd)
 })
 

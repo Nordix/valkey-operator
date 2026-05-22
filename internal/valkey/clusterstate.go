@@ -66,6 +66,7 @@ type SlotsRange struct {
 
 // GetClusterState connects to Valkey nodes and scrapes the current state.
 func GetClusterState(ctx context.Context, addresses []string, port int, username, password string, tlsCfg *tls.Config) *ClusterState {
+	log := logf.FromContext(ctx)
 	state := ClusterState{
 		Shards:       make([]*ShardState, 0),
 		PendingNodes: make([]*NodeState, 0),
@@ -75,9 +76,19 @@ func GetClusterState(ctx context.Context, addresses []string, port int, username
 		// Attempt to connect to the Valkey node and extract information.
 		node := getNodeState(ctx, address, port, username, password, tlsCfg)
 		if node != nil {
+			slots := node.GetSlots()
+			log.V(1).Info("inspected node",
+				"address", address,
+				"nodeId", node.Id,
+				"shardId", node.ShardId,
+				"isPrimary", node.IsPrimary(),
+				"slots", slots,
+				"flags", node.Flags)
+
 			// Check if node is pending to be added.
-			if node.IsPrimary() && len(node.GetSlots()) == 0 {
+			if node.IsPrimary() && len(slots) == 0 {
 				// Node not part of any shard yet.
+				log.V(1).Info("node is pending (primary with no slots)", "address", address)
 				state.PendingNodes = append(state.PendingNodes, node)
 				continue
 			}
@@ -98,12 +109,17 @@ func GetClusterState(ctx context.Context, addresses []string, port int, username
 			// Add node and update shard information.
 			shard.Nodes = append(shard.Nodes, node)
 			if node.IsPrimary() {
-				ranges, _ := parseSlotsRanges(node.GetSlots())
+				ranges, _ := parseSlotsRanges(slots)
 				shard.Slots = ranges
 				shard.PrimaryId = node.Id
+				log.V(1).Info("added primary to shard", "address", address, "shardId", shard.Id, "slots", ranges)
 			}
 		}
 	}
+
+	log.V(1).Info("cluster state summary",
+		"numShards", len(state.Shards),
+		"numPendingNodes", len(state.PendingNodes))
 	return &state
 }
 
@@ -233,14 +249,20 @@ func (n *NodeState) IsReplicationInSync() bool {
 // primary from other primaries removes it from their node tables, which
 // prevents them from voting in the replica's failover election.
 func (s *ClusterState) HasReplicaOf(nodeId string) bool {
+	return s.FindReplicaOf(nodeId) != ""
+}
+
+// FindReplicaOf returns the address of a replica that considers nodeId its primary.
+// Returns empty string if no such replica exists.
+func (s *ClusterState) FindReplicaOf(nodeId string) string {
 	for _, shard := range s.Shards {
 		for _, node := range shard.Nodes {
 			if node.PrimaryIdFromSelf() == nodeId {
-				return true
+				return node.Address
 			}
 		}
 	}
-	return false
+	return ""
 }
 
 // PrimaryIdFromSelf returns the primary node ID that this node reports as its

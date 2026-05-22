@@ -958,7 +958,7 @@ spec:
 
 		It("creates a functioning cluster backed by Deployments", func() {
 			defer func() {
-				cmd := exec.Command("kubectl", "delete", "-f", deploymentSampleFile, "--ignore-not-found=true", "--wait=false")
+				cmd := exec.Command("kubectl", "delete", "-f", deploymentSampleFile, "--ignore-not-found=true", "--wait=true", "--timeout=60s")
 				_, _ = utils.Run(cmd)
 			}()
 

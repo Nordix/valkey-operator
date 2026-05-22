@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -206,23 +207,77 @@ func shardExistsInTopology(state *valkey.ClusterState, shardIndex int, nodes *va
 // primary, regardless of its node-index label. This handles the post-failover
 // case where node-index=1 (or higher) was promoted by Valkey.
 // Returns ("", "") if no primary is found.
-func findShardPrimary(state *valkey.ClusterState, shardIndex int, nodes *valkeyv1.ValkeyNodeList) (nodeID, ip string) {
+// func findShardPrimary(state *valkey.ClusterState, shardIndex int, nodes *valkeyv1.ValkeyNodeList) (nodeID, ip string) {
+// 	si := strconv.Itoa(shardIndex)
+// 	for i := range nodes.Items {
+// 		n := &nodes.Items[i]
+// 		if n.Labels[LabelShardIndex] != si || n.Status.PodIP == "" {
+// 			continue
+// 		}
+// 		for _, shard := range state.Shards {
+// 			if len(shard.Slots) == 0 {
+// 				continue
+// 			}
+// 			primary := shard.GetPrimaryNode()
+// 			if primary != nil && primary.Address == n.Status.PodIP {
+// 				return primary.Id, n.Status.PodIP
+// 			}
+// 		}
+// 	}
+// 	return "", ""
+// }
+
+// findShardPrimaryDebug is like findShardPrimary but logs why no primary was found.
+func findShardPrimaryDebug(state *valkey.ClusterState, shardIndex int, nodes *valkeyv1.ValkeyNodeList, log logr.Logger) (nodeID, ip string) {
 	si := strconv.Itoa(shardIndex)
+	var shardPods []string // "name=IP" for logging
+	var shardPodIPs []string
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
-		if n.Labels[LabelShardIndex] != si || n.Status.PodIP == "" {
+		if n.Labels[LabelShardIndex] != si {
 			continue
 		}
-		for _, shard := range state.Shards {
-			if len(shard.Slots) == 0 {
-				continue
-			}
-			primary := shard.GetPrimaryNode()
-			if primary != nil && primary.Address == n.Status.PodIP {
-				return primary.Id, n.Status.PodIP
+		if n.Status.PodIP == "" {
+			log.V(1).Info("findShardPrimary: pod has no IP", "node", n.Name, "shardIndex", shardIndex)
+			continue
+		}
+		shardPodIPs = append(shardPodIPs, n.Status.PodIP)
+		shardPods = append(shardPods, fmt.Sprintf("%s=%s", n.Name, n.Status.PodIP))
+	}
+
+	for _, shard := range state.Shards {
+		primary := shard.GetPrimaryNode()
+		if primary == nil {
+			continue
+		}
+		for _, podIP := range shardPodIPs {
+			if primary.Address == podIP {
+				if len(shard.Slots) == 0 {
+					log.V(1).Info("findShardPrimary: primary has no slots", "shardIndex", shardIndex, "primaryIP", podIP, "primaryId", primary.Id)
+					continue
+				}
+				return primary.Id, podIP
 			}
 		}
 	}
+
+	// Log why we didn't find a primary - include CLUSTER NODES from first available node
+	var clusterNodesOutput string
+	for _, shard := range state.Shards {
+		for _, node := range shard.Nodes {
+			if node.ClusterNodes != "" {
+				clusterNodesOutput = node.ClusterNodes
+				break
+			}
+		}
+		if clusterNodesOutput != "" {
+			break
+		}
+	}
+	log.Info("findShardPrimary: no primary found",
+		"shardIndex", shardIndex,
+		"shardPods", shardPods,
+		"clusterNodes", clusterNodesOutput)
 	return "", ""
 }
 

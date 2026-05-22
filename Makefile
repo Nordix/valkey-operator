@@ -102,6 +102,11 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter "${TEST_LABELS}" -timeout 30m
 	$(MAKE) cleanup-test-e2e
 
+.PHONY: test-e2e-repeat
+test-e2e-repeat: setup-test-e2e manifests generate fmt vet ## Run a specific e2e test repeatedly. Use TEST_FOCUS and TEST_REPEAT.
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go run github.com/onsi/ginkgo/v2/ginkgo --tags=e2e -v --focus="${TEST_FOCUS}" --repeat=${TEST_REPEAT} --timeout=120m ./test/e2e/
+	$(MAKE) cleanup-test-e2e
+
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
