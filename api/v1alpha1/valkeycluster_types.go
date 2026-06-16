@@ -48,6 +48,27 @@ const (
 	PDBPolicyDisabled PDBPolicy = "Disabled"
 )
 
+// RollingUpdateStrategy controls how shard rolling updates are performed.
+// +kubebuilder:validation:Enum=auto;surge;inPlace
+type RollingUpdateStrategy string
+
+const (
+	// RollingUpdateStrategyAuto selects surge when no persistence is configured, inPlace otherwise.
+	RollingUpdateStrategyAuto RollingUpdateStrategy = "auto"
+	// RollingUpdateStrategySurge creates a temporary extra replica before rolling each shard.
+	RollingUpdateStrategySurge RollingUpdateStrategy = "surge"
+	// RollingUpdateStrategyInPlace rolls nodes in-place, relying on existing replicas for HA.
+	RollingUpdateStrategyInPlace RollingUpdateStrategy = "inPlace"
+)
+
+// RollingUpdateSpec configures rolling update behavior.
+type RollingUpdateSpec struct {
+	// Strategy selects rolling update behavior: auto (default), surge, or inPlace.
+	// +kubebuilder:default=auto
+	// +optional
+	Strategy RollingUpdateStrategy `json:"strategy,omitempty"`
+}
+
 // ValkeyClusterSpec defines the desired state of ValkeyCluster.
 // +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.workloadType == 'Deployment')",message="persistence requires workloadType StatefulSet"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.persistence) || has(self.persistence)",message="persistence cannot be removed once set"
@@ -71,6 +92,7 @@ type ValkeyClusterSpec struct {
 
 	// The number of replicas for each shard group.
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=99
 	Replicas int32 `json:"replicas,omitempty"`
 
 	// Override resource requirements for the Valkey container in each pod
@@ -133,6 +155,10 @@ type ValkeyClusterSpec struct {
 	// +kubebuilder:default=Managed
 	// +optional
 	PodDisruptionBudget PDBPolicy `json:"podDisruptionBudget,omitempty"`
+
+	// RollingUpdate configures rolling update behavior for shard groups.
+	// +optional
+	RollingUpdate *RollingUpdateSpec `json:"rollingUpdate,omitempty"`
 }
 
 // TLSConfig defines the TLS configuration for ValkeyCluster.

@@ -2640,6 +2640,7 @@ spec:
               replicas:
                 description: The number of replicas for each shard group.
                 format: int32
+                maximum: 99
                 minimum: 0
                 type: integer
               resources:
@@ -2701,6 +2702,20 @@ spec:
                       otherwise to an implementation-defined value. Requests cannot exceed Limits.
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
+                type: object
+              rollingUpdate:
+                description: RollingUpdate configures rolling update behavior for
+                  shard groups.
+                properties:
+                  strategy:
+                    default: auto
+                    description: 'Strategy selects rolling update behavior: auto (default),
+                      surge, or inPlace.'
+                    enum:
+                    - auto
+                    - surge
+                    - inPlace
+                    type: string
                 type: object
               shards:
                 description: The number of shards groups. Each shard group contains

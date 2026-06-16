@@ -481,15 +481,27 @@ func (r *ValkeyClusterReconciler) reconcileValkeyNodes(ctx context.Context, clus
 
 	nodesPerShard := 1 + int(cluster.Spec.Replicas)
 	totalCreated := 0
+	useSurgeRoll := effectiveRollingStrategy(cluster) == valkeyiov1alpha1.RollingUpdateStrategySurge
+	// During surge rolling update, the surge replica may become primary after
+	// failover. Include it in the range used for primary identification.
+	nodesForPrimaryLookup := nodesPerShard
+	if useSurgeRoll {
+		nodesForPrimaryLookup = surgeNodeIndex(cluster) + 1
+	}
 
-	// Scrape cluster state once for proactive failover decisions, but only
-	// when at least one node actually needs a roll. During initial bootstrap
-	// no nodes exist, so state stays nil. The snapshot is safe to reuse
-	// across the loop: replicaFirstNodeOrder uses it to place the actual
-	// primary last within each shard, and after an update we requeue
-	// immediately, re-scraping fresh state before any further rolls.
+	// Scrape cluster state when a roll is needed or surge replicas exist
+	// (surge cleanup requires knowing if the surge is still the primary).
 	var clusterState *valkey.ClusterState
-	if anyNodeRequiresRoll(cluster, nodes, configHash) {
+	needsState := anyNodeRequiresRoll(cluster, nodes, configHash)
+	if !needsState && useSurgeRoll {
+		for shardIndex := range int(cluster.Spec.Shards) {
+			if shardHasSurgeReplica(cluster, shardIndex, nodes) {
+				needsState = true
+				break
+			}
+		}
+	}
+	if needsState {
 		operatorPassword, err := fetchSystemUserPassword(ctx, operatorUser, r.Client, cluster.Name, cluster.Namespace)
 		if err != nil {
 			return false, fmt.Errorf("failed to fetch operator password for proactive failover: %w", err)
@@ -503,10 +515,18 @@ func (r *ValkeyClusterReconciler) reconcileValkeyNodes(ctx context.Context, clus
 		// identified from cluster state, defer rather than roll in an unknown order.
 		// New shards (not yet in the topology) are exempt — they need creation, not rolling.
 		if clusterState != nil && shardExistsInTopology(clusterState, shardIndex, nodes) &&
-			primaryNodeIndexForShard(shardIndex, nodesPerShard, nodes, clusterState) < 0 {
+			primaryNodeIndexForShard(shardIndex, nodesForPrimaryLookup, nodes, clusterState) < 0 {
 			log.Info("cannot identify primary for shard, deferring roll", "shardIndex", shardIndex)
 			return true, nil
 		}
+
+		// Surge rolling update: ensure surge replica is synced before rolling the shard.
+		if useSurgeRoll && shardNeedsRoll(cluster, shardIndex, nodes, configHash) {
+			if !r.ensureSurgeSynced(ctx, cluster, shardIndex, nodes, clusterState, configHash) {
+				continue
+			}
+		}
+
 		// Iterate nodes replica-first: use live cluster state to identify the
 		// actual primary (which may differ from node-index=0 after a failover)
 		// and place it last.
@@ -521,6 +541,19 @@ func (r *ValkeyClusterReconciler) reconcileValkeyNodes(ctx context.Context, clus
 			if nodeCreated {
 				totalCreated++
 			}
+		}
+
+		// Surge rolling update: failover back and clean up surge replica after shard is fully rolled.
+		if useSurgeRoll && shardHasSurgeReplica(cluster, shardIndex, nodes) &&
+			!shardNeedsRoll(cluster, shardIndex, nodes, configHash) {
+			done, err := r.cleanupSurgeReplica(ctx, cluster, shardIndex, nodes, clusterState)
+			if err != nil {
+				return false, err
+			}
+			if done {
+				return true, nil
+			}
+			continue // surge is still primary, waiting for node 0 to sync
 		}
 	}
 
@@ -1298,6 +1331,12 @@ func (r *ValkeyClusterReconciler) deleteExcessValkeyNodes(ctx context.Context, c
 			continue
 		}
 		if shardIndex >= int(cluster.Spec.Shards) || nodeIndex >= nodesPerShard {
+			// Don't delete surge replicas here — they are managed by the surge
+			// rolling update logic in reconcileValkeyNodes. If a roll completed
+			// or the operator crashed, reconcileValkeyNodes removes them.
+			if isSurgeReplica(node) && shardIndex < int(cluster.Spec.Shards) {
+				continue
+			}
 			if err := r.Delete(ctx, node); err != nil {
 				if !apierrors.IsNotFound(err) {
 					return false, fmt.Errorf("delete excess ValkeyNode %s: %w", node.Name, err)

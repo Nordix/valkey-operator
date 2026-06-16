@@ -310,6 +310,15 @@ These events are emitted during cluster maintenance operations.
 | `StaleNodeForgotten` | Normal | Stale node is forgotten from the cluster |
 | `NodeForgetFailed` | Warning | Forgetting a node fails |
 
+### Rolling update events
+
+These events are emitted during rolling updates depending on the rolling update strategy.
+
+| Event Type | Type | Description |
+|---|---|---|
+| `SurgeReplicaCreated` | Normal | A temporary surge replica was created for a shard before rolling |
+| `SurgeReplicaRemoved` | Normal | The surge replica was removed after the shard roll completed |
+
 ### Status events
 
 These events provide high-level status information about the cluster.
