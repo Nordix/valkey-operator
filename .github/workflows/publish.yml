@@ -2,10 +2,10 @@
 name: Publish
 
 on:
-  pull_request:
   push:
     branches:
       - 'main'
+      - 'set-version-and-branch-in-publish'
     tags:
       - 'v*'
 
