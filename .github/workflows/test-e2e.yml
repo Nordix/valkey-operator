@@ -57,6 +57,4 @@ jobs:
         run: kind version
 
       - name: Running Test e2e
-        run: |
-          go mod tidy
-          make test-e2e TEST_LABELS="${{ matrix.bucket }}"
+        run: make test-e2e TEST_LABELS="${{ matrix.bucket }}"
