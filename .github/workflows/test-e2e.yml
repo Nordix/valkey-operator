@@ -49,7 +49,7 @@ jobs:
         run: echo "buckets=$(make -s test-e2e-matrix)" >> "$GITHUB_OUTPUT"
 
   test-e2e:
-    name: e2e (${{ matrix.bucket }})
+    name: e2e (filter=${{ matrix.bucket }})
     needs: prepare
     runs-on: ubuntu-latest
     strategy:
