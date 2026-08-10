@@ -18,6 +18,24 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: .go-version
+          cache: false  # explicit actions/cache below owns the Go caches
+
+      # Explicit Go build+module cache. setup-go's built-in cache saves only
+      # once per go.mod hash and never refreshes it (see cache-save.ts:
+      # "not saving cache" on key hit), so it can't keep a warm build cache and
+      # every run cold-compiles. This saves on every run (github.sha in the key)
+      # and restores the latest via restore-keys. Content-addressed, so it can
+      # never serve stale code.
+      - name: Cache Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
+            go-build-${{ runner.os }}-
 
       # A test can match two buckets via its own or inherited Describe/Context
       # labels, which would run it twice across the matrix. Fail fast if so,
@@ -46,6 +64,20 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: .go-version
+          cache: false  # explicit actions/cache below owns the Go caches
+
+      # See the prepare job for why an explicit cache is needed (setup-go's
+      # built-in cache saves once per go.mod and never refreshes).
+      - name: Cache Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
+            go-build-${{ runner.os }}-
 
       - name: Install the latest version of kind
         run: |

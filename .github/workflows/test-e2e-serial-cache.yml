@@ -1,0 +1,51 @@
+name: E2E Tests (serial + cache baseline)
+
+# Serial e2e run (no matrix) WITH the Go build cache, to compare against the
+# parallel matrix version in test-e2e.yml. Purpose: decide whether the matrix
+# split is worth the added complexity once caching alone is applied.
+# Remove once the comparison is done.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-e2e:
+    name: Run on Ubuntu (serial + cache)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: .go-version
+          cache: false  # explicit actions/cache below owns the Go caches
+
+      # Explicit Go build+module cache. setup-go's built-in cache saves only
+      # once per go.mod hash and never refreshes it, so it can't keep a warm
+      # build cache. This saves every run (github.sha key) and restores the
+      # latest via restore-keys. Content-addressed, so never serves stale code.
+      - name: Cache Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
+            go-build-${{ runner.os }}-
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Running Test e2e
+        run: make test-e2e
