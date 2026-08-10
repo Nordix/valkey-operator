@@ -85,9 +85,9 @@ KIND_CLUSTER ?= valkey-operator-test-e2e
 
 # ---------------------------------------------------------------------------
 # E2E test buckets — single source of truth for the parallel CI matrix.
-# Edit ONLY this space-separated list of labels; each becomes one matrix shard.
-# A catch-all shard is DERIVED as the negation of their union (see
-# test-e2e-matrix), so it can never drift or drop specs when you add a label.
+# Edit ONLY this space-separated list of labels; each becomes one matrix job.
+# A catch-all bucket is DERIVED as the negation of their union (see
+# test-e2e-matrix), so it can never drift or drop tests when you add a label.
 # Use 'make test-e2e-verify-buckets' to check the buckets are disjoint and
 # cover the whole suite. (Labels must be single words — no spaces.)
 # ---------------------------------------------------------------------------
@@ -124,31 +124,33 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: test-e2e-matrix
-test-e2e-matrix: ## Emit the e2e label buckets (positive + derived catch-all) as a JSON array for the CI matrix
+test-e2e-matrix: ## Emit the e2e label buckets as a JSON array for the CI matrix
 	@jq -nc '$$ARGS.positional' --args $(E2E_BUCKETS) "$(E2E_CATCHALL)"
 
 .PHONY: test-e2e-verify-buckets
-test-e2e-verify-buckets: manifests generate ## Verify the label buckets are disjoint and cover the whole e2e suite (dry-run, no cluster needed)
-	@echo ">> dry-run: enumerating the full e2e suite and each bucket (no Kind cluster required)"
+test-e2e-verify-buckets: ## Verify no e2e test matches two buckets (would run twice in the matrix)
+	@echo ">> dry-run: enumerating the e2e suite once and checking the buckets (no Kind cluster required)"
 	@go test -tags=e2e ./test/e2e/ -ginkgo.dry-run --ginkgo.json-report=/tmp/e2e-all.json >/dev/null 2>&1 || true
-	@: > /tmp/e2e-assign.txt
-	@$(MAKE) -s test-e2e-matrix | jq -r '.[]' | while IFS= read -r f; do \
-	  go test -tags=e2e ./test/e2e/ -ginkgo.dry-run -ginkgo.label-filter "$$f" \
-	    --ginkgo.json-report=/tmp/e2e-b.json >/dev/null 2>&1 || true; \
-	  ids=$$(jq -r '.[].SpecReports[] | select(.LeafNodeType=="It" and .State != "skipped") | "\(.LeafNodeLocation.FileName):\(.LeafNodeLocation.LineNumber)"' /tmp/e2e-b.json); \
-	  printf '  %3d  %s\n' "$$(echo "$$ids" | grep -c .)" "$$f"; \
-	  echo "$$ids" | grep . >> /tmp/e2e-assign.txt || true; \
-	done
-	@total=$$(jq '[.[].SpecReports[] | select(.LeafNodeType=="It")] | length' /tmp/e2e-all.json); \
+	@# One report -> per-test "id<TAB>label,label,..." rows (effective = It + container labels).
+	@jq -r '.[].SpecReports[] | select(.LeafNodeType=="It") | "\(.LeafNodeLocation.FileName):\(.LeafNodeLocation.LineNumber)\t\((((.LeafNodeLabels // []) + [.ContainerHierarchyLabels[]?[]?]) | unique) | join(","))"' /tmp/e2e-all.json > /tmp/e2e-spec-labels.txt
+	@total=$$(cut -f1 /tmp/e2e-spec-labels.txt | sort -u | grep -c .); \
+	: > /tmp/e2e-assign.txt; \
+	for b in $(E2E_BUCKETS); do \
+	  n=$$(awk -F'\t' -v b="$$b" '{split($$2,a,","); for(i in a) if(a[i]==b){print $$1; break}}' /tmp/e2e-spec-labels.txt | tee -a /tmp/e2e-assign.txt | grep -c .); \
+	  printf '  %3d  %s\n' "$$n" "$$b"; \
+	done; \
+	catchall=$$(awk -F'\t' 'BEGIN{split("$(E2E_BUCKETS)",bk," ")} {hit=0; split($$2,a,","); for(i in a) for(j in bk) if(a[i]==bk[j]) hit=1; if(!hit) print $$1}' /tmp/e2e-spec-labels.txt | tee -a /tmp/e2e-assign.txt | grep -c .); \
+	printf '  %3d  %s\n' "$$catchall" "$(E2E_CATCHALL)"; \
+	echo "  ---"; \
 	assigned=$$(grep -c . /tmp/e2e-assign.txt); \
-	echo "  ---"; printf '  assigned=%d  suite-total=%d\n' "$$assigned" "$$total"; \
+	printf '  assigned=%d  suite-total=%d\n' "$$assigned" "$$total"; \
 	overlap=$$(sort /tmp/e2e-assign.txt | uniq -d); \
-	if [ -n "$$overlap" ]; then echo "FAIL: spec(s) in more than one bucket:"; echo "$$overlap" | sed 's/^/  OVERLAP /'; exit 1; fi; \
-	if [ "$$assigned" -ne "$$total" ]; then echo "FAIL: buckets cover $$assigned of $$total specs (gap — check filter syntax)"; exit 1; fi; \
-	echo "OK: every e2e spec is in exactly one bucket"
+	if [ -n "$$overlap" ]; then echo "FAIL: test(s) in more than one bucket:"; echo "$$overlap" | sed 's/^/  OVERLAP /'; exit 1; fi; \
+	if [ "$$assigned" -ne "$$total" ]; then echo "FAIL: buckets cover $$assigned of $$total tests (gap)"; exit 1; fi; \
+	echo "OK: every e2e test is in exactly one bucket"
 
 .PHONY: e2e-labels
-e2e-labels: manifests generate ## List every label declared in the e2e suite, with how many specs carry each (dry-run, no cluster needed)
+e2e-labels: manifests generate ## List e2e labels and how many tests carry each
 	@go test -tags=e2e ./test/e2e/ -ginkgo.dry-run --ginkgo.json-report=/tmp/e2e-all.json >/dev/null 2>&1 || true
 	@echo ">> e2e labels (label: spec count):"
 	@jq -r '[.[].SpecReports[] | select(.LeafNodeType=="It") | ((.LeafNodeLabels // []) + [.ContainerHierarchyLabels[]?[]?] | unique) | .[]] | group_by(.) | map({label: .[0], count: length}) | sort_by(-.count) | .[] | "  \(.count)\t\(.label)"' /tmp/e2e-all.json

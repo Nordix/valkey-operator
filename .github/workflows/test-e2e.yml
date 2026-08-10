@@ -19,8 +19,10 @@ jobs:
         with:
           go-version-file: .go-version
 
-      # Gate: fail fast if any spec falls outside all buckets or matches more than one.
-      - name: Verify label buckets partition the suite
+      # A test can match two buckets via its own or inherited Describe/Context
+      # labels, which would run it twice across the matrix. Fail fast if so,
+      # naming the file:line (coverage itself is guaranteed by the catch-all).
+      - name: Verify no test is in two buckets
         run: make test-e2e-verify-buckets
 
       # Emit the matrix from the same buckets the verify step just checked.
