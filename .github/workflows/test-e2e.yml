@@ -32,9 +32,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-${{ github.sha }}
+          key: go-build-${{ runner.os }}-${{ hashFiles('.go-version', '**/go.sum') }}-${{ github.sha }}
           restore-keys: |
-            go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
+            go-build-${{ runner.os }}-${{ hashFiles('.go-version', '**/go.sum') }}-
             go-build-${{ runner.os }}-
 
       # A test can match two buckets via its own or inherited Describe/Context
@@ -74,9 +74,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-${{ github.sha }}
+          key: go-build-${{ runner.os }}-${{ hashFiles('.go-version', '**/go.sum') }}-${{ github.sha }}
           restore-keys: |
-            go-build-${{ runner.os }}-${{ hashFiles('**/go.sum') }}-
+            go-build-${{ runner.os }}-${{ hashFiles('.go-version', '**/go.sum') }}-
             go-build-${{ runner.os }}-
 
       - name: Install the latest version of kind
