@@ -6,8 +6,6 @@ name: E2E Tests (orig, serial baseline)
 
 on:
   push:
-    branches:
-      - 'main'
   pull_request:
 
 jobs:
