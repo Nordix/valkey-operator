@@ -49,10 +49,20 @@ const valkeyClientImage = "valkey/valkey:9.0.0"
 
 var (
 	// managerImage is the manager image to be built and loaded for testing.
-	managerImage = "valkey/valkey-operator:v0.0.1"
+	// Overridable via E2E_MANAGER_IMAGE so CI can build the image once and load
+	// the same tag here (see .github/workflows/test-e2e.yml).
+	managerImage = envOrDefault("E2E_MANAGER_IMAGE", "valkey/valkey-operator:v0.0.1")
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
 )
+
+// envOrDefault returns the value of the environment variable key, or def if unset.
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
 // The default setup requires Kind and CertManager.
@@ -73,9 +83,16 @@ var _ = BeforeSuite(func() {
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to purge old events")
 
 	By("building the manager image")
-	cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
+	// Skip the build when the image is pre-provided (e.g. built once in CI and
+	// loaded here), following the CERT_MANAGER_INSTALL_SKIP / KUBECTL_KUBERC
+	// env-toggle pattern. The image is still loaded into Kind below.
+	if os.Getenv("E2E_SKIP_IMAGE_BUILD") == "true" {
+		_, _ = fmt.Fprintf(GinkgoWriter, "E2E_SKIP_IMAGE_BUILD=true, using pre-built image %s\n", managerImage)
+	} else {
+		cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
+		_, err = utils.Run(cmd)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
+	}
 
 	By("loading the manager image on Kind")
 	err = utils.LoadImageToKindClusterWithName(managerImage)
