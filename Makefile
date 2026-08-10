@@ -83,6 +83,21 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= valkey-operator-test-e2e
 
+# ---------------------------------------------------------------------------
+# E2E test buckets — single source of truth for the parallel CI matrix.
+# Edit ONLY the positive buckets below; each line is a Ginkgo label-filter
+# expression. The catch-all bucket is DERIVED as the negation of their union
+# (see test-e2e-matrix), so it can never drift or drop specs when you add a
+# bucket. Use 'make test-e2e-verify-buckets' to check the buckets are disjoint
+# and cover the whole suite.
+# ---------------------------------------------------------------------------
+define E2E_BUCKETS_LINES
+scaling
+valkeynode || WorkloadRoll || ImageUpgrade
+ValkeyCluster || topology-spread
+endef
+export E2E_BUCKETS_LINES
+
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	@command -v $(KIND) >/dev/null 2>&1 || { \
@@ -107,6 +122,48 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+
+.PHONY: test-e2e-matrix
+test-e2e-matrix: ## Emit the e2e label buckets (positive + derived catch-all) as a JSON array for the CI matrix
+	@catchall="!( $$(printf '%s\n' "$$E2E_BUCKETS_LINES" | awk 'NF{ printf "%s(%s)", sep, $$0; sep=" || " }') )"; \
+	{ printf '%s\n' "$$E2E_BUCKETS_LINES" | sed '/^$$/d'; printf '%s\n' "$$catchall"; } | jq -R . | jq -sc .
+
+.PHONY: test-e2e-verify-buckets
+test-e2e-verify-buckets: manifests generate ## Verify the label buckets are disjoint and cover the whole e2e suite (dry-run, no cluster needed)
+	@echo ">> dry-run: enumerating the full e2e suite and each bucket (no Kind cluster required)"
+	@go test -tags=e2e ./test/e2e/ -ginkgo.dry-run --ginkgo.json-report=/tmp/e2e-all.json >/dev/null 2>&1 || true
+	@: > /tmp/e2e-assign.txt
+	@$(MAKE) -s test-e2e-matrix | jq -r '.[]' | while IFS= read -r f; do \
+	  go test -tags=e2e ./test/e2e/ -ginkgo.dry-run -ginkgo.label-filter "$$f" \
+	    --ginkgo.json-report=/tmp/e2e-b.json >/dev/null 2>&1 || true; \
+	  n=$$(jq '[.[].SpecReports[] | select(.LeafNodeType=="It" and .State != "skipped")] | length' /tmp/e2e-b.json); \
+	  printf '  %3d  %s\n' "$$n" "$$f"; \
+	  jq -r '.[].SpecReports[] | select(.LeafNodeType=="It" and .State != "skipped") | "\(.LeafNodeLocation.FileName):\(.LeafNodeLocation.LineNumber)"' /tmp/e2e-b.json >> /tmp/e2e-assign.txt; \
+	done
+	@total=$$(jq '[.[].SpecReports[] | select(.LeafNodeType=="It")] | length' /tmp/e2e-all.json); \
+	sum=$$(wc -l < /tmp/e2e-assign.txt | tr -d ' '); \
+	echo "  ---"; printf '  assigned=%d  suite-total=%d\n' "$$sum" "$$total"; \
+	dupes=$$(sort /tmp/e2e-assign.txt | uniq -d); \
+	if [ -n "$$dupes" ]; then \
+	  echo "FAIL: the following spec(s) match MORE THAN ONE bucket (overlapping filters):"; \
+	  echo "$$dupes" | sed 's/^/  OVERLAP /'; exit 1; \
+	fi; \
+	all=$$(jq -r '.[].SpecReports[] | select(.LeafNodeType=="It") | "\(.LeafNodeLocation.FileName):\(.LeafNodeLocation.LineNumber)"' /tmp/e2e-all.json | sort -u); \
+	assigned=$$(sort -u /tmp/e2e-assign.txt); \
+	missing=$$(comm -23 <(echo "$$all") <(echo "$$assigned")); \
+	if [ -n "$$missing" ]; then \
+	  echo "FAIL: the following spec(s) match NO bucket (coverage gap):"; \
+	  echo "$$missing" | sed 's/^/  MISSING /'; exit 1; \
+	fi; \
+	echo "OK: every e2e spec is in exactly one bucket"
+
+.PHONY: e2e-labels
+e2e-labels: manifests generate ## List every label declared in the e2e suite, with how many specs carry each (dry-run, no cluster needed)
+	@go test -tags=e2e ./test/e2e/ -ginkgo.dry-run --ginkgo.json-report=/tmp/e2e-all.json >/dev/null 2>&1 || true
+	@echo ">> e2e labels (label: spec count):"
+	@jq -r '[.[].SpecReports[] | select(.LeafNodeType=="It") | ((.LeafNodeLabels // []) + [.ContainerHierarchyLabels[]?[]?] | unique) | .[]] | group_by(.) | map({label: .[0], count: length}) | sort_by(-.count) | .[] | "  \(.count)\t\(.label)"' /tmp/e2e-all.json
+	@unlabeled=$$(jq '[.[].SpecReports[] | select(.LeafNodeType=="It" and (((.LeafNodeLabels // []) + [.ContainerHierarchyLabels[]?[]?]) | length) == 0)] | length' /tmp/e2e-all.json); \
+	echo "  --"; printf '  %s\t(no label)\n' "$$unlabeled"
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

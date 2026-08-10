@@ -7,9 +7,37 @@ on:
   pull_request:
 
 jobs:
-  test-e2e:
-    name: Run on Ubuntu
+  prepare:
+    name: Prepare e2e matrix
     runs-on: ubuntu-latest
+    outputs:
+      buckets: ${{ steps.set.outputs.buckets }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: .go-version
+
+      # Gate: fail fast if any spec falls outside all buckets or matches more than one.
+      - name: Verify label buckets partition the suite
+        run: make test-e2e-verify-buckets
+
+      # Emit the matrix from the same buckets the verify step just checked.
+      - name: Build matrix
+        id: set
+        run: echo "buckets=$(make -s test-e2e-matrix)" >> "$GITHUB_OUTPUT"
+
+  test-e2e:
+    name: e2e (${{ matrix.bucket }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bucket: ${{ fromJSON(needs.prepare.outputs.buckets) }}
     steps:
       - name: Clone the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -31,4 +59,4 @@ jobs:
       - name: Running Test e2e
         run: |
           go mod tidy
-          make test-e2e
+          make test-e2e TEST_LABELS="${{ matrix.bucket }}"
