@@ -515,7 +515,7 @@ func deleteReplicaPod(ctx *ChaosContext) error {
 	for _, shard := range ctx.TargetShards {
 		pod, err := getShardReplicaPod(ctx.ClusterName, ctx.Namespace, shard)
 		if err != nil {
-			return fmt.Errorf("skip: %w", err)
+			return fmt.Errorf("skip: deleting replica pod for shard %d: %w", shard, err)
 		}
 		_, _ = fmt.Fprintf(GinkgoWriter, "  Deleting replica pod: %s (shard %d)\n", pod, shard)
 		pods = append(pods, pod)
@@ -584,7 +584,7 @@ func deleteReplicaWorkload(ctx *ChaosContext) error {
 	for _, shard := range ctx.TargetShards {
 		pod, err := getShardReplicaPod(ctx.ClusterName, ctx.Namespace, shard)
 		if err != nil {
-			return fmt.Errorf("skip: %w", err)
+			return fmt.Errorf("skip: deleting replica workload for shard %d: %w", shard, err)
 		}
 		workload, err := getWorkloadForPod(pod, ctx.Namespace, ctx.WorkloadType)
 		if err != nil {
@@ -659,7 +659,7 @@ func networkPartitionReplica(ctx *ChaosContext) error {
 	for _, shard := range ctx.TargetShards {
 		pod, err := getShardReplicaPod(ctx.ClusterName, ctx.Namespace, shard)
 		if err != nil {
-			return fmt.Errorf("skip: %w", err)
+			return fmt.Errorf("skip: partitioning replica node for shard %d: %w", shard, err)
 		}
 		nodeName, err := getPodNodeName(pod, ctx.Namespace)
 		if err != nil {
@@ -735,7 +735,7 @@ func pauseReplicaContainer(ctx *ChaosContext) error {
 	for _, shard := range ctx.TargetShards {
 		pod, err := getShardReplicaPod(ctx.ClusterName, ctx.Namespace, shard)
 		if err != nil {
-			return fmt.Errorf("skip: %w", err)
+			return fmt.Errorf("skip: pausing replica container for shard %d: %w", shard, err)
 		}
 		_, _ = fmt.Fprintf(GinkgoWriter, "  Pausing replica container in pod: %s (shard %d) for %s\n", pod, shard, duration.Truncate(time.Millisecond))
 		pods = append(pods, pod)
