@@ -207,15 +207,16 @@ spec:
 `, clusterName, shards, replicas, workloadType)
 
 		if tolerationSec > 0 {
-			manifest += fmt.Sprintf(`  tolerations:
-  - key: node.kubernetes.io/not-ready
-    operator: Exists
-    effect: NoExecute
-    tolerationSeconds: %d
-  - key: node.kubernetes.io/unreachable
-    operator: Exists
-    effect: NoExecute
-    tolerationSeconds: %d
+			manifest += fmt.Sprintf(`  scheduling:
+    tolerations:
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: %d
+    - key: node.kubernetes.io/unreachable
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: %d
 `, tolerationSec, tolerationSec)
 		}
 
