@@ -114,3 +114,21 @@ jobs:
           E2E_SKIP_IMAGE_BUILD: "true"
           E2E_MANAGER_IMAGE: ${{ env.MANAGER_IMAGE }}
         run: make test-e2e TEST_LABELS="${{ matrix.bucket.filter }}"
+
+  e2e-result:
+    name: Final e2e result
+    if: always()
+    needs: [prepare, test-e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all e2e jobs passed
+        run: |
+          if [[ "${{ needs.prepare.result }}" != "success" ]]; then
+            echo "Prepare job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-e2e.result }}" != "success" ]]; then
+            echo "One or more e2e matrix jobs failed"
+            exit 1
+          fi
+          echo "All e2e jobs passed"
