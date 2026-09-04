@@ -103,6 +103,50 @@ make build-installer IMG=<some-registry>/valkey-operator:tag
 
 This produces `dist/install.yaml` which can be applied with `kubectl apply -f`.
 
+## Regenerating the version-gated config
+
+`internal/controller/version_gated_config.go` is generated: it maps each Valkey
+config directive to the minimum Valkey version that understands it, so the
+operator can drop directives an older target image would reject. Regenerate it
+when a new Valkey minor is released, or when its first release candidate appears
+(to gate directives for users testing the rc). Regenerating after the final
+release retightens any rc-based entries to the final version and drops
+directives that did not survive to release.
+
+Prerequisite: a local checkout of the [Valkey source](https://github.com/valkey-io/valkey)
+with its release tags fetched.
+
+```sh
+# From the operator repo root; point --valkey-repo at your Valkey checkout.
+hack/gen_version_gated_config.py \
+    --valkey-repo /path/to/valkey \
+    --baseline 8.1.0 \
+    --out internal/controller/version_gated_config.go
+```
+
+- `--baseline` is the lowest Valkey version to gate against (the operator's
+  supported floor); directives present at or before it are omitted.
+- For each Valkey minor version (9.0, 9.1, 9.2, ...), the script reads one
+  release: the final `X.Y.0` if it has been released, otherwise the newest
+  release candidate (so an rc image being tested still gets gating). Once the
+  final is released it takes over, and its versions replace the rc ones. Patch
+  releases and hidden (internal) directives are skipped. Do not edit the
+  generated file by hand.
+
+Verify the committed file is up to date with `--check`, which exits non-zero
+if regeneration would change it:
+
+```sh
+hack/gen_version_gated_config.py \
+    --valkey-repo /path/to/valkey \
+    --baseline 8.1.0 \
+    --out internal/controller/version_gated_config.go \
+    --check
+```
+
+Pass `--debug` to log, per scanned tag, how many directives were parsed and
+which are newly introduced.
+
 ## Run the operator locally
 
 The kubebuilder scaffolding gives a build target `make run` which runs the operator process locally, but towards a K8s cluster.

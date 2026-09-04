@@ -25,7 +25,6 @@ import (
 	"slices"
 	"strings"
 
-	semver "github.com/Masterminds/semver/v3"
 	valkeyiov1alpha1 "github.com/valkey-io/valkey-operator/api/v1alpha1"
 	"github.com/valkey-io/valkey-operator/internal/valkey"
 	corev1 "k8s.io/api/core/v1"
@@ -49,10 +48,8 @@ const (
 )
 
 // versionGatedConfig maps user-facing config directives to the minimum Valkey
-// version that understands them.
-var versionGatedConfig = map[string]*semver.Version{
-	"tls-auto-reload-interval": semver.MustParse("9.1.0-rc1"),
-}
+// version that understands them. It is generated from the Valkey source tree
+// by hack/gen_version_gated_config.py; see version_gated_config.go.
 
 //go:embed scripts/*
 var scripts embed.FS
