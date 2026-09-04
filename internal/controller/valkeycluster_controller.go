@@ -156,6 +156,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		_ = r.updateStatus(ctx, cluster, nil)
 		return ctrl.Result{}, err
 	}
+	configWarnings := make([]configWarning, 0, 2)
 	// Surface a ConfigurationWarning condition when an explicit
 	// terminationGracePeriodSeconds is too short for the graceful failover on
 	// SIGTERM to finish before SIGKILL. The value is honoured; the operator does
@@ -164,15 +165,14 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	rec := recommendedGracePeriodSeconds(cluster)
 	if g := cluster.Spec.TerminationGracePeriodSeconds; g != nil && *g < rec {
 		msg := fmt.Sprintf("spec.terminationGracePeriodSeconds (%ds) is below the recommended %ds for cluster-manual-failover-timeout; SIGKILL may interrupt the graceful failover on shutdown", *g, rec)
-		if !meta.IsStatusConditionTrue(cluster.Status.Conditions, valkeyiov1alpha1.ConditionConfigurationWarning) {
-			log.Info("terminationGracePeriodSeconds is below the recommended minimum for graceful failover",
-				"requested", *g, "recommended", rec)
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, valkeyiov1alpha1.ReasonGracePeriodTooShort, "ReconcileValkeyCluster", "%s", msg)
-		}
-		setCondition(cluster, valkeyiov1alpha1.ConditionConfigurationWarning, valkeyiov1alpha1.ReasonGracePeriodTooShort, msg, metav1.ConditionTrue)
-	} else {
-		removeConditionIfReason(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionConfigurationWarning, valkeyiov1alpha1.ReasonGracePeriodTooShort)
+		configWarnings = append(configWarnings, configWarning{
+			reason:  valkeyiov1alpha1.ReasonGracePeriodTooShort,
+			message: msg,
+		})
 	}
+
+	configWarnings = append(configWarnings, versionGateConfigWarnings(cluster)...)
+	r.applyConfigurationWarnings(ctx, cluster, configWarnings)
 
 	// Soft guard: TLS with IP announce (including default IP). Non-blocking.
 	if cluster.GetTLS() != nil && !cluster.PrefersHostnameAnnounce() {
