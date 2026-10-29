@@ -19,6 +19,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
 	valkeyiov1alpha1 "github.com/valkey-io/valkey-operator/api/v1alpha1"
@@ -154,6 +155,88 @@ func mergePatchContainers(base, patches []corev1.Container) ([]corev1.Container,
 	return output, nil
 }
 
+// valkeyAnnounceArgsAndEnv returns --cluster-announce-* flags and env for the
+// server container: pod IP by default, pod FQDN under the headless Service in
+// Hostname mode (STS serviceName must be that headless Service).
+func valkeyAnnounceArgsAndEnv(node *valkeyiov1alpha1.ValkeyNode) ([]string, []corev1.EnvVar) {
+	podIPEnv := corev1.EnvVar{
+		Name: "POD_IP",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "status.podIP",
+			},
+		},
+	}
+	if node.Spec.PreferredEndpointType != valkeyiov1alpha1.PreferredEndpointTypeHostname {
+		return []string{"--cluster-announce-ip", "$(POD_IP)"}, []corev1.EnvVar{podIPEnv}
+	}
+
+	clusterName := node.Labels[LabelCluster]
+	if clusterName == "" {
+		return []string{"--cluster-announce-ip", "$(POD_IP)"}, []corev1.EnvVar{podIPEnv}
+	}
+	fqdn := "$(POD_NAME)." + headlessServiceFQDN(clusterName, node.Namespace, node.Spec.ClusterDomain)
+	podNameEnv := corev1.EnvVar{
+		Name: "POD_NAME",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.name",
+			},
+		},
+	}
+	return []string{"--cluster-announce-hostname", fqdn}, []corev1.EnvVar{podNameEnv}
+}
+
+// statefulSetServiceName is the governing Service for STS pod DNS. Cluster-owned
+// nodes use the shared cluster headless Service so multi 1-pod STS get per-pod
+// FQDNs. Standalone nodes keep the resource name (historical behaviour).
+func statefulSetServiceName(node *valkeyiov1alpha1.ValkeyNode) string {
+	if clusterName := node.Labels[LabelCluster]; clusterName != "" {
+		return headlessServiceName(clusterName)
+	}
+	return valkeyNodeResourceName(node)
+}
+
+// headlessServiceFQDN is the cluster headless Service DNS name used for Hostname
+// announce. It is deliberately relative (no trailing dot): the announced name
+// ends up in CLUSTER SLOTS and becomes the client's TLS SNI value, where a
+// trailing dot is invalid (RFC 6066) and a poor cert SAN, so announce must match
+// the default TLS ServerName (which is this name). Do not re-add the trailing
+// dot on resolver grounds: the per-pod announce name (<pod>.<this>) has >=5 dots,
+// so under the pod default ndots:5 it resolves absolute-first in one query; only
+// short custom clusterDomains fall below the threshold and walk the search list,
+// a cost accepted over breaking SNI.
+func headlessServiceFQDN(clusterName, namespace, clusterDomain string) string {
+	if clusterDomain == "" {
+		clusterDomain = valkeyiov1alpha1.DefaultClusterDomain
+	}
+	domain := strings.TrimSuffix(clusterDomain, ".")
+	return fmt.Sprintf("%s.%s.svc.%s", headlessServiceName(clusterName), namespace, domain)
+}
+
+// statefulSetAfterServiceNameChange builds a create-ready STS with desired
+// serviceName and labels but the live pod template (and PVC templates), so a
+// serviceName migration does not apply an unauthorized template roll.
+func statefulSetAfterServiceNameChange(desired, live *appsv1.StatefulSet) *appsv1.StatefulSet {
+	out := desired.DeepCopy()
+	out.ResourceVersion = ""
+	out.UID = ""
+	out.Generation = 0
+	out.CreationTimestamp = metav1.Time{}
+	out.ManagedFields = nil
+	out.Status = appsv1.StatefulSetStatus{}
+	out.Spec.Template = *live.Spec.Template.DeepCopy()
+	out.Spec.VolumeClaimTemplates = live.Spec.VolumeClaimTemplates
+	out.Spec.ServiceName = desired.Spec.ServiceName
+	return out
+}
+
+// refuseDesiredSTSCreate is true when creating the full desired STS would
+// skip WorkloadRevision (STS gone after orphan, pod still running).
+func refuseDesiredSTSCreate(node *valkeyiov1alpha1.ValkeyNode, pod *corev1.Pod, desiredHash string) bool {
+	return pod != nil && isClusterOwned(node) && !workloadRevisionAllows(node, desiredHash)
+}
+
 // buildContainersDef builds the base containers definition for the ValkeyNode
 // and applies any strategic merge patches from node.Spec.Containers.
 func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, error) {
@@ -162,42 +245,33 @@ func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, 
 		image = node.Spec.Image
 	}
 
+	announceArgs, announceEnv := valkeyAnnounceArgsAndEnv(node)
+
 	containers := []corev1.Container{
 		{
 			Name:      "server",
 			Image:     image,
 			Resources: node.Spec.Resources,
-			Command: []string{
+			Command: append([]string{
 				"valkey-server",
 				"/config/valkey.conf",
-				"--cluster-announce-ip",
-				"$(POD_IP)",
+			}, append(announceArgs, []string{
 				"--primaryuser",
 				replicationUser,
 				"--primaryauth",
 				"$(PRIMARY_AUTH)",
-			},
-			Env: []corev1.EnvVar{
-				{
-					Name: "POD_IP",
-					ValueFrom: &corev1.EnvVarSource{
-						FieldRef: &corev1.ObjectFieldSelector{
-							FieldPath: "status.podIP",
+			}...)...),
+			Env: append(announceEnv, corev1.EnvVar{
+				Name: "PRIMARY_AUTH",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: getSystemPasswordSecretName(node.Labels[LabelCluster]),
 						},
+						Key: replicationUser,
 					},
 				},
-				{
-					Name: "PRIMARY_AUTH",
-					ValueFrom: &corev1.EnvVarSource{
-						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: getSystemPasswordSecretName(node.Labels[LabelCluster]),
-							},
-							Key: replicationUser,
-						},
-					},
-				},
-			},
+			}),
 			Ports: []corev1.ContainerPort{
 				{
 					Name:          "client",
@@ -283,13 +357,17 @@ func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, 
 			MountPath: tlsCertMountPath,
 			ReadOnly:  true,
 		})
+		tlsArgs := fmt.Sprintf("--tls --cacert %s", tlsCertMountPath+"/"+tlsSecretKeyCA)
+		if node.Spec.TLS.RequiresClientCertificate() {
+			tlsArgs = fmt.Sprintf("%s --cert %s --key %s", tlsArgs,
+				tlsCertMountPath+"/"+tlsSecretKeyCert, tlsCertMountPath+"/"+tlsSecretKeyKey)
+		}
 		containers[0].Env = append(containers[0].Env,
 			corev1.EnvVar{Name: "VALKEY_TLS_ENABLED", Value: "true"},
 			corev1.EnvVar{Name: "VALKEY_TLS_CA_FILE", Value: tlsCertMountPath + "/" + tlsSecretKeyCA},
 			corev1.EnvVar{Name: "VALKEY_TLS_CERT_FILE", Value: tlsCertMountPath + "/" + tlsSecretKeyCert},
 			corev1.EnvVar{Name: "VALKEY_TLS_KEY_FILE", Value: tlsCertMountPath + "/" + tlsSecretKeyKey},
-			corev1.EnvVar{Name: "VALKEY_TLS_ARGS", Value: fmt.Sprintf("--tls --cacert %s --cert %s --key %s",
-				tlsCertMountPath+"/"+tlsSecretKeyCA, tlsCertMountPath+"/"+tlsSecretKeyCert, tlsCertMountPath+"/"+tlsSecretKeyKey)},
+			corev1.EnvVar{Name: "VALKEY_TLS_ARGS", Value: tlsArgs},
 		)
 	}
 
@@ -303,8 +381,10 @@ func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, 
 		)
 	}
 
-	// Add exporter sidecar if enabled.
-	if node.Spec.Exporter.Enabled {
+	// Add exporter sidecar only on an explicit true: the sidecar needs the
+	// _exporter credentials only the cluster controller provisions, so a
+	// standalone node must not gain one by default.
+	if node.Spec.Exporter.Enabled != nil && *node.Spec.Exporter.Enabled {
 		containers = append(containers, generateMetricsExporterContainerDef(node.Spec.Exporter, node.Labels[LabelCluster], node.Spec.TLS))
 	}
 
@@ -488,10 +568,14 @@ func buildValkeyNodePodTemplateSpec(node *valkeyiov1alpha1.ValkeyNode, labels ma
 			Name: tlsVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: node.Spec.TLS.Certificate.SecretName,
+					SecretName: node.Spec.TLS.Certificates.Server.SecretName,
 				},
 			},
 		})
+	}
+
+	if node.Spec.ServiceAccountName != "" {
+		podSpec.ServiceAccountName = node.Spec.ServiceAccountName
 	}
 
 	// Back /data with a PVC when persistence is set; otherwise an emptyDir so
@@ -529,10 +613,31 @@ func buildValkeyNodePodTemplateSpec(node *valkeyiov1alpha1.ValkeyNode, labels ma
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: labels,
+			Labels: podTemplateLabels(node, labels),
 		},
 		Spec: podSpec,
 	}, nil
+}
+
+// podTemplateLabels returns a new map so the workload selector never picks up
+// user labels: the selector is immutable after creation.
+func podTemplateLabels(node *valkeyiov1alpha1.ValkeyNode, selectorLabels map[string]string) map[string]string {
+	var user map[string]valkeyiov1alpha1.LabelValue
+	if node.Spec.PodMetadata != nil {
+		user = node.Spec.PodMetadata.Labels
+	}
+	return withUserMetadata(user, selectorLabels)
+}
+
+// withUserMetadata returns user entries overlaid by the operator's, so an
+// operator key always wins.
+func withUserMetadata[V ~string](user map[string]V, operator map[string]string) map[string]string {
+	out := make(map[string]string, len(user)+len(operator))
+	for k, v := range user {
+		out[k] = string(v)
+	}
+	maps.Copy(out, operator)
+	return out
 }
 
 // buildValkeyNodeDeployment constructs a single-replica Deployment for a
@@ -584,7 +689,7 @@ func buildValkeyNodeStatefulSet(node *valkeyiov1alpha1.ValkeyNode) (*appsv1.Stat
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    func(i int32) *int32 { return &i }(1),
-			ServiceName: valkeyNodeResourceName(node),
+			ServiceName: statefulSetServiceName(node),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},

@@ -42,6 +42,15 @@ func getEnvVar(t *testing.T, envVars []corev1.EnvVar, name string) *corev1.EnvVa
 	return nil
 }
 
+func hasEnvVar(envVars []corev1.EnvVar, name string) bool {
+	for i := range envVars {
+		if envVars[i].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func newTestValkeyNode(name, namespace string) *valkeyv1.ValkeyNode {
 	return &valkeyv1.ValkeyNode{
 		ObjectMeta: metav1.ObjectMeta{
@@ -51,6 +60,9 @@ func newTestValkeyNode(name, namespace string) *valkeyv1.ValkeyNode {
 		Spec: valkeyv1.ValkeyNodeSpec{
 			Image:               "valkey/valkey:9.0.0",
 			ServerConfigMapName: "valkey-config",
+			// Off by default here so the exporter-agnostic cases assert on the
+			// server container alone. A nil Enabled means enabled.
+			Exporter: valkeyv1.ExporterSpec{Enabled: new(false)},
 		},
 	}
 }
@@ -213,7 +225,7 @@ func TestBuildValkeyNodeStatefulSet(t *testing.T) {
 
 	assert.Equal(t, "valkey-mynode", ss.Name)
 	assert.Equal(t, "test-ns", ss.Namespace)
-	assert.Equal(t, "valkey-mynode", ss.Spec.ServiceName, "ServiceName should match resource name")
+	assert.Equal(t, "valkey-mynode", ss.Spec.ServiceName, "standalone ServiceName should match resource name")
 	require.NotNil(t, ss.Spec.Replicas)
 	assert.Equal(t, int32(1), *ss.Spec.Replicas)
 
@@ -228,6 +240,129 @@ func TestBuildValkeyNodeStatefulSet(t *testing.T) {
 	// Verify the template has the right container
 	require.Len(t, ss.Spec.Template.Spec.Containers, 1)
 	assert.Equal(t, "server", ss.Spec.Template.Spec.Containers[0].Name)
+}
+
+func TestBuildValkeyNodeStatefulSet_ClusterOwnedUsesHeadlessServiceName(t *testing.T) {
+	node := newTestValkeyNode("mycluster-0-0", "test-ns")
+	node.Labels = map[string]string{LabelCluster: "mycluster"}
+	ss, err := buildValkeyNodeStatefulSet(node)
+	require.NoError(t, err)
+	assert.Equal(t, headlessServiceName("mycluster"), ss.Spec.ServiceName)
+}
+
+func TestValkeyAnnounceArgsAndEnv(t *testing.T) {
+	t.Run("default IP", func(t *testing.T) {
+		node := newTestValkeyNode("n", "ns")
+		args, env := valkeyAnnounceArgsAndEnv(node)
+		assert.Equal(t, []string{"--cluster-announce-ip", "$(POD_IP)"}, args)
+		require.Len(t, env, 1)
+		assert.Equal(t, "POD_IP", env[0].Name)
+	})
+	t.Run("Hostname FQDN", func(t *testing.T) {
+		node := newTestValkeyNode("mycluster-0-0", "ns")
+		node.Labels = map[string]string{LabelCluster: "mycluster"}
+		node.Spec.PreferredEndpointType = valkeyv1.PreferredEndpointTypeHostname
+		node.Spec.ClusterDomain = "example.local"
+		args, env := valkeyAnnounceArgsAndEnv(node)
+		assert.Equal(t, []string{
+			"--cluster-announce-hostname",
+			"$(POD_NAME).valkey-mycluster.ns.svc.example.local",
+		}, args)
+		require.Len(t, env, 1)
+		assert.Equal(t, "POD_NAME", env[0].Name)
+	})
+}
+
+func TestHeadlessServiceFQDN(t *testing.T) {
+	assert.Equal(t, "valkey-c.default.svc.cluster.local", headlessServiceFQDN("c", "default", ""))
+	assert.Equal(t, "valkey-c.ns.svc.corp.local", headlessServiceFQDN("c", "ns", "corp.local"))
+	assert.Equal(t, "valkey-c.ns.svc.corp.local", headlessServiceFQDN("c", "ns", "corp.local."))
+}
+
+func TestStatefulSetAfterServiceNameChange(t *testing.T) {
+	node := newTestValkeyNode("mycluster-0-0", "ns")
+	node.Labels = map[string]string{LabelCluster: "mycluster"}
+	desired, err := buildValkeyNodeStatefulSet(node)
+	require.NoError(t, err)
+	require.Equal(t, headlessServiceName("mycluster"), desired.Spec.ServiceName)
+
+	live := desired.DeepCopy()
+	live.Spec.ServiceName = "valkey-mycluster-0-0" // pre-migration value
+	live.Spec.Template.Annotations = map[string]string{"live": "template"}
+	live.UID = "live-uid"
+	live.ResourceVersion = "99"
+
+	// Desired template differs (would be a real roll if applied now).
+	desired.Spec.Template.Annotations = map[string]string{"desired": "template"}
+
+	out := statefulSetAfterServiceNameChange(desired, live)
+	assert.Equal(t, desired.Spec.ServiceName, out.Spec.ServiceName)
+	assert.Equal(t, live.Spec.Template.Annotations, out.Spec.Template.Annotations)
+	assert.Empty(t, out.ResourceVersion)
+	assert.Empty(t, string(out.UID))
+	// Must not carry the desired template that would bypass WorkloadRevision.
+	assert.NotEqual(t, desired.Spec.Template.Annotations, out.Spec.Template.Annotations)
+}
+
+func TestRefuseDesiredSTSCreate(t *testing.T) {
+	ctrl := true
+	owned := newTestValkeyNode("c-0-0", "ns")
+	owned.OwnerReferences = []metav1.OwnerReference{{
+		Kind:       "ValkeyCluster",
+		Controller: &ctrl,
+	}}
+	pod := &corev1.Pod{}
+	hash := "abc"
+
+	t.Run("missing STS with live pod and WR mismatch", func(t *testing.T) {
+		assert.True(t, refuseDesiredSTSCreate(owned, pod, hash))
+	})
+	t.Run("WR matches", func(t *testing.T) {
+		n := owned.DeepCopy()
+		n.Spec.WorkloadRevision = hash
+		assert.False(t, refuseDesiredSTSCreate(n, pod, hash))
+	})
+	t.Run("no pod is first create", func(t *testing.T) {
+		assert.False(t, refuseDesiredSTSCreate(owned, nil, hash))
+	})
+	t.Run("standalone", func(t *testing.T) {
+		assert.False(t, refuseDesiredSTSCreate(newTestValkeyNode("solo", "ns"), pod, hash))
+	})
+}
+
+func TestBuildClusterValkeyNode_DiscoveryPrimitives(t *testing.T) {
+	base := &valkeyv1.ValkeyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+		Spec:       valkeyv1.ValkeyClusterSpec{Shards: 1, Replicas: 0},
+	}
+
+	t.Run("default IP leaves PreferredEndpointType empty and still sets ClusterDomain", func(t *testing.T) {
+		n := buildClusterValkeyNode(base, 0, 0)
+		assert.Empty(t, n.Spec.PreferredEndpointType)
+		assert.Equal(t, valkeyv1.DefaultClusterDomain, n.Spec.ClusterDomain)
+		assert.Equal(t, "c", n.Labels[LabelCluster])
+	})
+
+	t.Run("IP with custom ClusterDomain still sets ClusterDomain", func(t *testing.T) {
+		c := base.DeepCopy()
+		c.Spec.Networking = &valkeyv1.NetworkingSpec{ClusterDomain: "corp.local"}
+		n := buildClusterValkeyNode(c, 0, 0)
+		assert.Empty(t, n.Spec.PreferredEndpointType)
+		assert.Equal(t, "corp.local", n.Spec.ClusterDomain)
+	})
+
+	t.Run("Hostname sets PreferredEndpointType and ClusterDomain", func(t *testing.T) {
+		c := base.DeepCopy()
+		c.Spec.Networking = &valkeyv1.NetworkingSpec{
+			ClusterDomain: "example.local",
+			Discovery: &valkeyv1.DiscoverySpec{
+				PreferredEndpointType: valkeyv1.PreferredEndpointTypeHostname,
+			},
+		}
+		n := buildClusterValkeyNode(c, 0, 0)
+		assert.Equal(t, valkeyv1.PreferredEndpointTypeHostname, n.Spec.PreferredEndpointType)
+		assert.Equal(t, "example.local", n.Spec.ClusterDomain)
+	})
 }
 
 func TestBuildValkeyNodePVC(t *testing.T) {
@@ -252,7 +387,7 @@ func TestBuildValkeyNodePVC(t *testing.T) {
 func TestBuildValkeyNodePodTemplateSpec_WithExporter(t *testing.T) {
 	node := newTestValkeyNode("mynode", "test-ns")
 	node.Spec.Exporter = valkeyv1.ExporterSpec{
-		Enabled: true,
+		Enabled: new(true),
 	}
 	lbls := valkeyNodeLabels(node)
 	pts, err := buildValkeyNodePodTemplateSpec(node, lbls)
@@ -278,7 +413,7 @@ func TestBuildValkeyNodePodTemplateSpec_WithExporter(t *testing.T) {
 func TestBuildValkeyNodePodTemplateSpec_WithExporterCustomImage(t *testing.T) {
 	node := newTestValkeyNode("mynode", "test-ns")
 	node.Spec.Exporter = valkeyv1.ExporterSpec{
-		Enabled: true,
+		Enabled: new(true),
 		Image:   "my-exporter:v2.0.0",
 	}
 	lbls := valkeyNodeLabels(node)
@@ -287,6 +422,19 @@ func TestBuildValkeyNodePodTemplateSpec_WithExporterCustomImage(t *testing.T) {
 
 	require.Len(t, pts.Spec.Containers, 2)
 	assert.Equal(t, "my-exporter:v2.0.0", pts.Spec.Containers[1].Image)
+}
+
+// A ValkeyNode runs the sidecar only on an explicit enabled: true. The default
+// is resolved at the cluster level; a standalone node must not gain a sidecar
+// whose _exporter credentials nothing provisions.
+func TestBuildValkeyNodePodTemplateSpec_ExporterUnsetOmitsSidecar(t *testing.T) {
+	node := newTestValkeyNode("mynode", "test-ns")
+	node.Spec.Exporter = valkeyv1.ExporterSpec{}
+	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
+	require.NoError(t, err)
+
+	require.Len(t, pts.Spec.Containers, 1)
+	assert.Equal(t, "server", pts.Spec.Containers[0].Name)
 }
 
 func TestBuildValkeyNodePodTemplateSpec_Scheduling(t *testing.T) {
@@ -414,8 +562,10 @@ func TestBuildValkeyNodeConfigMap_WithManagedConfig(t *testing.T) {
 	node := newTestValkeyNode("mynode", "test-ns")
 	node.Spec.Persistence = &valkeyv1.PersistenceSpec{Size: resource.MustParse("5Gi")}
 	node.Spec.UsersACLSecretName = "mynode-users"
-	node.Spec.TLS = &valkeyv1.TLSConfig{
-		Certificate: valkeyv1.CertificateRef{SecretName: "tls-secret"},
+	node.Spec.TLS = &valkeyv1.NodeTLSSpec{
+		Certificates: valkeyv1.NodeTLSCertificates{
+			Server: valkeyv1.NodeCertificateRef{SecretName: "tls-secret"},
+		},
 	}
 
 	cm, err := buildValkeyNodeConfigMap(node)
@@ -427,7 +577,65 @@ func TestBuildValkeyNodeConfigMap_WithManagedConfig(t *testing.T) {
 	assert.Contains(t, conf, "cluster-config-file /data/nodes.conf")
 	assert.Contains(t, conf, "tls-port 6379")
 	assert.Contains(t, conf, "port 0")
-	assert.Contains(t, conf, "tls-auth-clients optional")
+}
+
+func TestBuildValkeyNodeConfigMap_WithClientCertAuth(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		authClients     valkeyv1.TLSAuthClients
+		authClientsUser valkeyv1.TLSAuthClientsUser
+		image           string
+		want            []string
+		notWant         []string
+	}{
+		{
+			name:            "required with CN mapping",
+			authClients:     valkeyv1.TLSAuthClientsRequired,
+			authClientsUser: valkeyv1.TLSAuthClientsUserCN,
+			want:            []string{"tls-auth-clients yes", "tls-auth-clients-user CN"},
+		},
+		{
+			name:            "required with URI mapping",
+			authClients:     valkeyv1.TLSAuthClientsRequired,
+			authClientsUser: valkeyv1.TLSAuthClientsUserURI,
+			image:           "valkey/valkey:9.1.0",
+			want:            []string{"tls-auth-clients yes", "tls-auth-clients-user URI"},
+		},
+		{
+			name:            "disabled drops client certificate processing",
+			authClients:     valkeyv1.TLSAuthClientsDisabled,
+			authClientsUser: valkeyv1.TLSAuthClientsUserDisabled,
+			want:            []string{"tls-auth-clients no"},
+			notWant:         []string{"tls-auth-clients-user"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := newTestValkeyNode("mynode", "test-ns")
+			if tc.image != "" {
+				node.Spec.Image = tc.image
+			}
+			node.Spec.TLS = &valkeyv1.NodeTLSSpec{
+				Certificates: valkeyv1.NodeTLSCertificates{
+					Server: valkeyv1.NodeCertificateRef{SecretName: "tls-secret"},
+				},
+				ClientAuth: &valkeyv1.TLSClientAuthSpec{
+					Mode:            tc.authClients,
+					CertificateUser: tc.authClientsUser,
+				},
+			}
+
+			cm, err := buildValkeyNodeConfigMap(node)
+			require.NoError(t, err)
+
+			conf := cm.Data["valkey.conf"]
+			for _, want := range tc.want {
+				assert.Contains(t, conf, want)
+			}
+			for _, notWant := range tc.notWant {
+				assert.NotContains(t, conf, notWant)
+			}
+		})
+	}
 }
 
 func TestBuildValkeyNodePodTemplateSpec_ConfigMapNameFallback(t *testing.T) {
@@ -538,7 +746,7 @@ func TestBuildValkeyNodePodTemplateSpec_WithContainerPatches(t *testing.T) {
 	node.Spec.Containers = []corev1.Container{
 		{Name: "metrics-exporter", Image: "custom-exporter:v2.0"},
 	}
-	node.Spec.Exporter = valkeyv1.ExporterSpec{Enabled: true}
+	node.Spec.Exporter = valkeyv1.ExporterSpec{Enabled: new(true)}
 	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
 	require.NoError(t, err)
 
@@ -588,16 +796,100 @@ func TestParseValkeyRole(t *testing.T) {
 	}
 }
 
+func TestParseClusterEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		info     string
+		expected bool
+	}{
+		{"enabled", "# Cluster\r\ncluster_enabled:1\r\n", true},
+		{"disabled", "# Cluster\r\ncluster_enabled:0\r\n", false},
+		{"absent", "# Replication\r\nrole:master\r\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, parseClusterEnabled(tt.info))
+		})
+	}
+}
+
+func TestParseClusterNodesRole(t *testing.T) {
+	tests := []struct {
+		name         string
+		clusterNodes string
+		expected     string
+	}{
+		{
+			// A real primary owns a slot range.
+			name:         "myself master owning slots is primary",
+			clusterNodes: "76dcce4b40c3114323dd077db7aa98151222b9a0 10.244.1.3:6379@16379 myself,master - 0 0 1 connected 5462-10922\n",
+			expected:     RolePrimary,
+		},
+		{
+			// Regression (issue #261 follow-up): a just-restarted replica reports
+			// myself,master for a few seconds before re-establishing replication,
+			// but owns no slots — it must still resolve to replica.
+			name:         "myself master owning no slots is replica (restart transient)",
+			clusterNodes: "37349cd33fe18465f36b46f09e392f6bb90688e1 10.244.2.6:6379@16379 myself,master - 0 0 1 connected\n",
+			expected:     RoleReplica,
+		},
+		{
+			// Scale-out: a new shard's primary has joined the cluster but has no
+			// slots yet. Indistinguishable from the restart transient above, so it
+			// resolves to replica — documented behaviour, not an oversight.
+			name:         "myself master before slot assignment is replica (scale-out)",
+			clusterNodes: "76dcce4b40c3114323dd077db7aa98151222b9a0 10.244.1.3:6379@16379 myself,master - 0 0 0 connected\n",
+			expected:     RoleReplica,
+		},
+		{
+			// ...and flips to primary as soon as CLUSTER ADDSLOTSRANGE lands, even
+			// for a single slot.
+			name:         "myself master becomes primary once it owns a slot",
+			clusterNodes: "76dcce4b40c3114323dd077db7aa98151222b9a0 10.244.1.3:6379@16379 myself,master - 0 0 1 connected 0\n",
+			expected:     RolePrimary,
+		},
+		{
+			name:         "myself slave is replica",
+			clusterNodes: "37349cd33fe18465f36b46f09e392f6bb90688e1 10.244.2.6:6379@16379 myself,slave 76dcce4b40c3114323dd077db7aa98151222b9a0 0 0 1 connected\n",
+			expected:     RoleReplica,
+		},
+		{
+			name: "picks the myself line among peers",
+			clusterNodes: "76dcce4b40c3114323dd077db7aa98151222b9a0 10.244.1.3:6379@16379 master - 0 0 1 connected 5462-10922\n" +
+				"37349cd33fe18465f36b46f09e392f6bb90688e1 10.244.2.6:6379@16379 myself,slave 76dcce4b40c3114323dd077db7aa98151222b9a0 0 0 1 connected\n",
+			expected: RoleReplica,
+		},
+		{
+			// A master mid-reshard holds only a migration marker, no owned
+			// range. HasSlotAssignment counts the marker, so it stays primary
+			// and matches what GetClusterState reports.
+			name:         "myself master holding only a migration marker is primary",
+			clusterNodes: "76dcce4b40c3114323dd077db7aa98151222b9a0 10.244.1.3:6379@16379 myself,master - 0 0 1 connected [5461-<-37349cd33fe18465f36b46f09e392f6bb90688e1]\n",
+			expected:     RolePrimary,
+		},
+		{
+			name:         "no myself line returns empty",
+			clusterNodes: "76dcce4b40c3114323dd077db7aa98151222b9a0 10.244.1.3:6379@16379 master - 0 0 1 connected 5462-10922\n",
+			expected:     "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, parseClusterNodesRole(tt.clusterNodes))
+		})
+	}
+}
+
 func TestBuildExporterContainer(t *testing.T) {
 	t.Run("default image", func(t *testing.T) {
-		exporter := valkeyv1.ExporterSpec{Enabled: true}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true)}
 		c := generateMetricsExporterContainerDef(exporter, "", nil)
 		assert.Equal(t, DefaultExporterImage, c.Image)
 		assert.Equal(t, "metrics-exporter", c.Name)
 	})
 
 	t.Run("custom image", func(t *testing.T) {
-		exporter := valkeyv1.ExporterSpec{Enabled: true, Image: "custom:1.0"}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true), Image: "custom:1.0"}
 		c := generateMetricsExporterContainerDef(exporter, "", nil)
 		assert.Equal(t, "custom:1.0", c.Image)
 	})
@@ -608,13 +900,13 @@ func TestBuildExporterContainer(t *testing.T) {
 				corev1.ResourceCPU: resource.MustParse("100m"),
 			},
 		}
-		exporter := valkeyv1.ExporterSpec{Enabled: true, Resources: resources}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true), Resources: resources}
 		c := generateMetricsExporterContainerDef(exporter, "", nil)
 		assert.Equal(t, resources, c.Resources)
 	})
 
 	t.Run("env contains redis addr", func(t *testing.T) {
-		exporter := valkeyv1.ExporterSpec{Enabled: true}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true)}
 		c := generateMetricsExporterContainerDef(exporter, "", nil)
 		redisAddr := getEnvVar(t, c.Env, "REDIS_ADDR")
 		assert.Equal(t, "redis://localhost:6379", redisAddr.Value)
@@ -623,41 +915,75 @@ func TestBuildExporterContainer(t *testing.T) {
 	})
 
 	t.Run("env contains rediss addr with tls", func(t *testing.T) {
-		exporter := valkeyv1.ExporterSpec{Enabled: true}
-		tlsSpec := &valkeyv1.TLSConfig{Certificate: valkeyv1.CertificateRef{SecretName: "my-tls-secret"}}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true)}
+		tlsSpec := &valkeyv1.NodeTLSSpec{
+			Certificates: valkeyv1.NodeTLSCertificates{
+				Server: valkeyv1.NodeCertificateRef{SecretName: "my-tls-secret"},
+			},
+		}
 
 		c := generateMetricsExporterContainerDef(exporter, "mycluster", tlsSpec)
 		redisAddr := getEnvVar(t, c.Env, "REDIS_ADDR")
 		assert.Equal(t, "rediss://localhost:6379", redisAddr.Value)
 		tlsCaCertFile := getEnvVar(t, c.Env, "REDIS_EXPORTER_TLS_CA_CERT_FILE")
 		assert.Equal(t, fmt.Sprintf("%s/%s", tlsCertMountPath, tlsSecretKeyCA), tlsCaCertFile.Value)
+		assert.False(t, hasEnvVar(c.Env, "REDIS_EXPORTER_TLS_SERVER_NAME"))
 		assert.Len(t, c.VolumeMounts, 1)
 		assert.Equal(t, tlsVolumeName, c.VolumeMounts[0].Name)
 		assert.Equal(t, tlsCertMountPath, c.VolumeMounts[0].MountPath)
 	})
 
+	t.Run("presents a client certificate when client auth is required", func(t *testing.T) {
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true)}
+		tlsSpec := &valkeyv1.NodeTLSSpec{
+			Certificates: valkeyv1.NodeTLSCertificates{
+				Server: valkeyv1.NodeCertificateRef{SecretName: "my-tls-secret"},
+			},
+			ClientAuth: &valkeyv1.TLSClientAuthSpec{Mode: valkeyv1.TLSAuthClientsRequired},
+		}
+
+		c := generateMetricsExporterContainerDef(exporter, "mycluster", tlsSpec)
+		assert.Equal(t, tlsCertMountPath+"/"+tlsSecretKeyCert,
+			getEnvVar(t, c.Env, "REDIS_EXPORTER_TLS_CLIENT_CERT_FILE").Value)
+		assert.Equal(t, tlsCertMountPath+"/"+tlsSecretKeyKey,
+			getEnvVar(t, c.Env, "REDIS_EXPORTER_TLS_CLIENT_KEY_FILE").Value)
+	})
+
+	t.Run("env contains tls server name when set", func(t *testing.T) {
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true)}
+		tlsSpec := &valkeyv1.NodeTLSSpec{
+			ServerName: "custom.example",
+			Certificates: valkeyv1.NodeTLSCertificates{
+				Server: valkeyv1.NodeCertificateRef{SecretName: "my-tls-secret"},
+			},
+		}
+
+		c := generateMetricsExporterContainerDef(exporter, "mycluster", tlsSpec)
+		assert.Equal(t, "custom.example", getEnvVar(t, c.Env, "REDIS_EXPORTER_TLS_SERVER_NAME").Value)
+	})
+
 	t.Run("args set from spec", func(t *testing.T) {
-		exporter := valkeyv1.ExporterSpec{Enabled: true, Args: []string{"-append-instance-role-label"}}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true), Args: []string{"-append-instance-role-label"}}
 		c := generateMetricsExporterContainerDef(exporter, "", nil)
 		assert.Equal(t, []string{"-append-instance-role-label"}, c.Args)
 	})
 
 	t.Run("security context passthrough", func(t *testing.T) {
 		sc := &corev1.SecurityContext{
-			AllowPrivilegeEscalation: boolPtr(false),
-			ReadOnlyRootFilesystem:   boolPtr(true),
-			RunAsNonRoot:             boolPtr(true),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(true),
+			RunAsNonRoot:             new(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
 		}
-		exporter := valkeyv1.ExporterSpec{Enabled: true, SecurityContext: sc}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true), SecurityContext: sc}
 		c := generateMetricsExporterContainerDef(exporter, "", nil)
 		assert.Equal(t, sc, c.SecurityContext, "SecurityContext should pass through verbatim")
 	})
 
 	t.Run("nil security context is noop", func(t *testing.T) {
-		exporter := valkeyv1.ExporterSpec{Enabled: true}
+		exporter := valkeyv1.ExporterSpec{Enabled: new(true)}
 		c := generateMetricsExporterContainerDef(exporter, "", nil)
 		assert.Nil(t, c.SecurityContext, "omitting SecurityContext must leave container SecurityContext nil")
 	})
@@ -813,7 +1139,7 @@ func TestBuildClusterValkeyNode_PropagatesSpecFields(t *testing.T) {
 				},
 				PriorityClassName: "high-priority",
 			},
-			Exporter: valkeyv1.ExporterSpec{Enabled: true},
+			Exporter: valkeyv1.ExporterSpec{Enabled: new(true)},
 			Containers: []corev1.Container{
 				{Name: "sidecar", Image: "sidecar:latest"},
 			},
@@ -1076,7 +1402,7 @@ func TestBuildValkeyNodePodTemplateSpec_PodSecurityContext_Passthrough(t *testin
 	gid := int64(56849)
 	fsGroup := int64(56849)
 	psc := &corev1.PodSecurityContext{
-		RunAsNonRoot:   boolPtr(true),
+		RunAsNonRoot:   new(true),
 		RunAsUser:      &uid,
 		RunAsGroup:     &gid,
 		FSGroup:        &fsGroup,
@@ -1105,6 +1431,83 @@ func TestBuildValkeyNodePodTemplateSpec_PodSecurityContext_NilIsNoop(t *testing.
 
 	assert.Equal(t, &corev1.PodSecurityContext{}, pts.Spec.SecurityContext,
 		"omitting PodSecurityContext must produce the empty SecurityContext the API server defaults to")
+}
+
+func TestBuildValkeyNodePodTemplateSpec_ServiceAccountName_Passthrough(t *testing.T) {
+	node := newTestValkeyNode("mynode", "test-ns")
+	node.Spec.ServiceAccountName = "my-sa"
+
+	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
+	require.NoError(t, err)
+	assert.Equal(t, "my-sa", pts.Spec.ServiceAccountName, "ServiceAccountName should be set on pod spec")
+}
+
+func TestBuildValkeyNodePodTemplateSpec_ServiceAccountName_EmptyIsNoop(t *testing.T) {
+	node := newTestValkeyNode("mynode", "test-ns")
+	pts, err := buildValkeyNodePodTemplateSpec(node, valkeyNodeLabels(node))
+	require.NoError(t, err)
+	assert.Empty(t, pts.Spec.ServiceAccountName, "omitting ServiceAccountName must leave the field unset so existing templates stay unchanged")
+}
+
+func TestBuildNodePodTemplate_PodMetadata(t *testing.T) {
+	for _, workloadType := range []valkeyv1.WorkloadType{valkeyv1.WorkloadTypeStatefulSet, valkeyv1.WorkloadTypeDeployment} {
+		t.Run(string(workloadType), func(t *testing.T) {
+			node := newTestValkeyNode("mycluster-0-0", "test-ns")
+			node.Labels = map[string]string{LabelCluster: "mycluster"}
+			node.Spec.WorkloadType = workloadType
+			node.Spec.PodMetadata = &valkeyv1.EmbeddedObjectMetadata{
+				Labels: map[string]valkeyv1.LabelValue{
+					"team":       "data",
+					LabelCluster: "spoofed",
+				},
+				Annotations: map[string]string{
+					"example.com/scrape": "true",
+					configHashKey:        "spoofed",
+				},
+			}
+
+			tmpl, err := buildNodePodTemplate(node)
+			require.NoError(t, err)
+
+			assert.Equal(t, "data", tmpl.Labels["team"])
+			assert.Equal(t, "mycluster", tmpl.Labels[LabelCluster], "operator labels win over podMetadata")
+			assert.Equal(t, "true", tmpl.Annotations["example.com/scrape"])
+			assert.Equal(t, nodeServerConfigRollHash(node), tmpl.Annotations[configHashKey], "operator annotations win over podMetadata")
+
+			var selector map[string]string
+			if workloadType == valkeyv1.WorkloadTypeDeployment {
+				dep, err := buildValkeyNodeDeployment(node)
+				require.NoError(t, err)
+				selector = dep.Spec.Selector.MatchLabels
+			} else {
+				sts, err := buildValkeyNodeStatefulSet(node)
+				require.NoError(t, err)
+				selector = sts.Spec.Selector.MatchLabels
+			}
+			assert.Equal(t, valkeyNodeLabels(node), selector, "podMetadata must stay out of the immutable selector")
+		})
+	}
+}
+
+func TestComputeWorkloadRevision_PodMetadata(t *testing.T) {
+	node := newTestValkeyNode("mycluster-0-0", "test-ns")
+	base, err := computeWorkloadRevision(node)
+	require.NoError(t, err)
+
+	node.Spec.PodMetadata = &valkeyv1.EmbeddedObjectMetadata{}
+	empty, err := computeWorkloadRevision(node)
+	require.NoError(t, err)
+	assert.Equal(t, base, empty, "an empty podMetadata must not roll pods")
+
+	node.Spec.PodMetadata.Labels = map[string]valkeyv1.LabelValue{"team": "data"}
+	withLabel, err := computeWorkloadRevision(node)
+	require.NoError(t, err)
+	assert.NotEqual(t, base, withLabel, "a pod label change must roll pods")
+
+	node.Spec.PodMetadata.Annotations = map[string]string{"example.com/scrape": "true"}
+	withAnnotation, err := computeWorkloadRevision(node)
+	require.NoError(t, err)
+	assert.NotEqual(t, withLabel, withAnnotation, "a pod annotation change must roll pods")
 }
 
 // TestDefaultImagePullPolicy pins the mirror of the API server's defaulting

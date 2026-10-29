@@ -24,6 +24,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 
 	valkeyv1 "github.com/valkey-io/valkey-operator/api/v1alpha1"
 	"github.com/valkey-io/valkey-operator/internal/valkey"
@@ -128,6 +129,13 @@ func annotations(cluster *valkeyv1.ValkeyCluster) map[string]string {
 	return maps.Clone(cluster.Annotations)
 }
 
+func effectiveImage(image string) string {
+	if image == "" {
+		return DefaultImage
+	}
+	return image
+}
+
 // This function takes a K8S object reference (eg: pod, secret, configmap, etc),
 // and a key, and value to add to, or replace an existing, annotation within the object.
 // Returns true if the annotation was added, or updated
@@ -165,6 +173,18 @@ func nodeIndexForAddress(address string, nodes *valkeyv1.ValkeyNodeList) int {
 		return -1
 	}
 	return nodeIndex
+}
+
+// hasNodeWithPodIP reports whether any ValkeyNode has podIP as its pod IP.
+// An empty podIP never matches, including against a ValkeyNode that has no pod
+// IP yet: two empty addresses do not identify the same node.
+func hasNodeWithPodIP(nodes []valkeyv1.ValkeyNode, podIP string) bool {
+	if podIP == "" {
+		return false
+	}
+	return slices.ContainsFunc(nodes, func(n valkeyv1.ValkeyNode) bool {
+		return n.Status.PodIP == podIP
+	})
 }
 
 // nodeRoleAndShard finds the ValkeyNode whose Status.PodIP matches address
@@ -315,23 +335,52 @@ func valkeyNodeName(clusterName string, shardIndex int, nodeIndex int) string {
 	return fmt.Sprintf("%s-%d-%d", clusterName, shardIndex, nodeIndex)
 }
 
-// getTLSConfig returns the TLS configuration for a ValkeyCluster.
-func getTLSConfig(ctx context.Context, c client.Reader, secretName, serverName, namespace string) (*tls.Config, error) {
+// tlsServerName is the hostname the operator pins on TLS connections to a
+// pod IP. override wins; otherwise the cluster headless Service FQDN under
+// clusterDomain (default cluster.local). headlessServiceFQDN is already a
+// DNS-1123 subdomain (no trailing dot) matching typical certificate SANs; the
+// TrimSuffix is a defensive no-op should a trailing dot ever be reintroduced.
+func tlsServerName(override, clusterName, namespace, clusterDomain string) string {
+	if override != "" {
+		return override
+	}
+	return strings.TrimSuffix(headlessServiceFQDN(clusterName, namespace, clusterDomain), ".")
+}
+
+// nodeTLSServerName is the hostname the operator pins when dialing a node's pod
+// IP. A cluster-owned node falls back to the cluster default while
+// spec.tls.serverName is empty: nodes created before that field existed carry
+// it only once the cluster controller next updates them.
+func nodeTLSServerName(node *valkeyv1.ValkeyNode) string {
+	override := ""
+	if node.Spec.TLS != nil {
+		override = node.Spec.TLS.ServerName
+	}
+	clusterName, ok := node.Labels[LabelCluster]
+	if !ok {
+		return override
+	}
+	return tlsServerName(override, clusterName, node.Namespace, node.Spec.ClusterDomain)
+}
+
+// getTLSConfig returns the TLS configuration for a ValkeyCluster and the
+// resourceVersion of the secret it was built from.
+func getTLSConfig(ctx context.Context, c client.Reader, secretName, serverName, namespace string, presentClientCert bool) (*tls.Config, string, error) {
 	secret := &corev1.Secret{}
 	err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, secret)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	caData, caOk := secret.Data[tlsSecretKeyCA]
 
 	if !caOk {
-		return nil, fmt.Errorf("TLS secret is missing required key: ca=%v", caOk)
+		return nil, "", fmt.Errorf("TLS secret is missing required key: ca=%v", caOk)
 	}
 
 	caCertPool := x509.NewCertPool()
 	if !caCertPool.AppendCertsFromPEM(caData) {
-		return nil, fmt.Errorf("failed to parse CA certificates from secret key %q", "ca.crt")
+		return nil, "", fmt.Errorf("failed to parse CA certificates from secret key %q", "ca.crt")
 	}
 
 	tlsCfg := &tls.Config{
@@ -339,5 +388,20 @@ func getTLSConfig(ctx context.Context, c client.Reader, secretName, serverName, 
 		ServerName: serverName,
 		MinVersion: tls.VersionTLS12,
 	}
-	return tlsCfg, nil
+	if !presentClientCert {
+		return tlsCfg, secret.ResourceVersion, nil
+	}
+
+	certData, certOk := secret.Data[tlsSecretKeyCert]
+	keyData, keyOk := secret.Data[tlsSecretKeyKey]
+	if !certOk || !keyOk {
+		return nil, "", fmt.Errorf("TLS secret %q is missing required key: cert=%v, key=%v", secretName, certOk, keyOk)
+	}
+
+	cert, err := tls.X509KeyPair(certData, keyData)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse TLS certificate/key from secret %q: %w", secretName, err)
+	}
+	tlsCfg.Certificates = []tls.Certificate{cert}
+	return tlsCfg, secret.ResourceVersion, nil
 }

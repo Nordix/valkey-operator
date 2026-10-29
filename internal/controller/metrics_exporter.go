@@ -25,7 +25,7 @@ import (
 )
 
 // generateMetricsExporterContainerDef generates the container definition for the metrics exporter sidecar.
-func generateMetricsExporterContainerDef(exporter valkeyiov1alpha1.ExporterSpec, clusterName string, tlsSpec *valkeyiov1alpha1.TLSConfig) corev1.Container {
+func generateMetricsExporterContainerDef(exporter valkeyiov1alpha1.ExporterSpec, clusterName string, tlsSpec *valkeyiov1alpha1.NodeTLSSpec) corev1.Container {
 	exporterImage := DefaultExporterImage
 	if exporter.Image != "" {
 		exporterImage = exporter.Image
@@ -58,6 +58,24 @@ func generateMetricsExporterContainerDef(exporter valkeyiov1alpha1.ExporterSpec,
 			Name:  "REDIS_EXPORTER_TLS_CA_CERT_FILE",
 			Value: fmt.Sprintf("%s/%s", tlsCertMountPath, tlsSecretKeyCA),
 		})
+		if tlsSpec.RequiresClientCertificate() {
+			env = append(env,
+				corev1.EnvVar{
+					Name:  "REDIS_EXPORTER_TLS_CLIENT_CERT_FILE",
+					Value: fmt.Sprintf("%s/%s", tlsCertMountPath, tlsSecretKeyCert),
+				},
+				corev1.EnvVar{
+					Name:  "REDIS_EXPORTER_TLS_CLIENT_KEY_FILE",
+					Value: fmt.Sprintf("%s/%s", tlsCertMountPath, tlsSecretKeyKey),
+				},
+			)
+		}
+		if tlsSpec.ServerName != "" {
+			env = append(env, corev1.EnvVar{
+				Name:  "REDIS_EXPORTER_TLS_SERVER_NAME",
+				Value: tlsSpec.ServerName,
+			})
+		}
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      tlsVolumeName,
 			MountPath: tlsCertMountPath,

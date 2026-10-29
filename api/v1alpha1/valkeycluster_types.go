@@ -305,6 +305,9 @@ type ZonePinning struct {
 //
 // zone.pinning: reject a passthrough nodeSelector that sets the zone key the pinning render owns.
 // +kubebuilder:validation:XValidation:rule="!has(self.scheduling) || !has(self.scheduling.zone) || !has(self.scheduling.zone.pinning) || !has(self.scheduling.nodeSelector) || !('topology.kubernetes.io/zone' in self.scheduling.nodeSelector)",message="scheduling.nodeSelector cannot set topology.kubernetes.io/zone while zone.pinning is set: pinning renders that key itself, and the curated value would overwrite yours"
+//
+// discovery: Hostname announce needs stable StatefulSet pod names.
+// +kubebuilder:validation:XValidation:rule="!has(self.networking) || !has(self.networking.discovery) || !has(self.networking.discovery.preferredEndpointType) || self.networking.discovery.preferredEndpointType != 'Hostname' || !has(self.workloadType) || self.workloadType == 'StatefulSet'",message="networking.discovery.preferredEndpointType Hostname requires workloadType StatefulSet (or omit workloadType for the StatefulSet default)"
 type ValkeyClusterSpec struct {
 
 	// Override the default Valkey image
@@ -373,8 +376,8 @@ type ValkeyClusterSpec struct {
 	// +optional
 	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
 
-	// Networking groups how clients and peers reach cluster nodes (TLS today;
-	// discovery and external access land in follow-ups under this object).
+	// Networking groups how clients and peers reach cluster nodes (TLS,
+	// in-cluster discovery announce, and later external access).
 	// +optional
 	Networking *NetworkingSpec `json:"networking,omitempty"`
 
@@ -387,39 +390,229 @@ type ValkeyClusterSpec struct {
 	// When set, this overrides the default PodSecurityContext.
 	// +optional
 	PodSecurityContext *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
+
+	// ServiceAccountName specifies the name of the ServiceAccount to use for
+	// ValkeyCluster pods. If unset, the namespace's default ServiceAccount is used.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// PodMetadata adds labels and annotations to every Valkey pod of the cluster.
+	// They are not part of the workload selector, so they can be changed at any
+	// time; a change rolls the pods. Keys the operator sets itself are rejected.
+	// +optional
+	PodMetadata *EmbeddedObjectMetadata `json:"podMetadata,omitempty"`
 }
+
+// PreferredEndpointType mirrors valkey's cluster-preferred-endpoint-type directive.
+// +kubebuilder:validation:Enum=IP;Hostname
+type PreferredEndpointType string
+
+const (
+	// PreferredEndpointTypeIP announces pod IPs (default).
+	PreferredEndpointTypeIP PreferredEndpointType = "IP"
+	// PreferredEndpointTypeHostname announces stable per-pod DNS names under the
+	// cluster headless Service.
+	PreferredEndpointTypeHostname PreferredEndpointType = "Hostname"
+
+	// DefaultClusterDomain matches kubelet --cluster-domain when the CR omits
+	// networking.clusterDomain. Announce and TLS FQDNs have no trailing dot.
+	DefaultClusterDomain = "cluster.local"
+)
 
 // NetworkingSpec groups connectivity configuration for the cluster.
-// Phase 1 of the networking API (#318): TLS only. Discovery (in-cluster
-// endpoint announcement) and external access will nest here later.
 type NetworkingSpec struct {
+	// ClusterDomain is the DNS suffix kubelet publishes Service DNS under
+	// (kubelet --cluster-domain). Used when building Hostname announce FQDNs
+	// and the default TLS ServerName. Must match the cluster. Default cluster.local.
+	// +kubebuilder:default="cluster.local"
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\.?$`
+	// +optional
+	ClusterDomain string `json:"clusterDomain,omitempty"`
+
+	// Discovery configures in-cluster endpoint announcement after CLUSTER SLOTS.
+	// +optional
+	Discovery *DiscoverySpec `json:"discovery,omitempty"`
+
 	// TLS configuration for the cluster.
 	// +optional
-	TLS *TLSConfig `json:"tls,omitempty"`
+	TLS *TLSSpec `json:"tls,omitempty"`
 }
 
-// TLSConfig defines the TLS configuration for ValkeyCluster.
-type TLSConfig struct {
-	// Certificate is a reference to a Kubernetes secret that contains the certificate and private key for enabling TLS.
-	// The referenced secret should contain the following:
+// DiscoverySpec configures how nodes announce themselves for in-cluster clients.
+type DiscoverySpec struct {
+	// PreferredEndpointType selects IP (default) or Hostname announcement.
+	// Hostname uses per-pod DNS under the cluster headless Service
+	// (<pod>.<headless>.<namespace>.svc.<clusterDomain>) and requires
+	// workloadType StatefulSet (or the default).
+	// +kubebuilder:default=IP
+	// +optional
+	PreferredEndpointType PreferredEndpointType `json:"preferredEndpointType,omitempty"`
+}
+
+// TLSAuthClients controls how Valkey treats incoming client TLS certificates.
+// API enum values are mapped to Valkey `tls-auth-clients` directive values.
+// +kubebuilder:validation:Enum=Required;Optional;Disabled
+type TLSAuthClients string
+
+const (
+	// TLSAuthClientsOptional accepts both authenticated and unauthenticated clients.
+	// Maps to `tls-auth-clients optional`.
+	TLSAuthClientsOptional TLSAuthClients = "Optional"
+	// TLSAuthClientsRequired enforces mTLS - clients must present a certificate
+	// signed by the configured CA. Maps to `tls-auth-clients yes`.
+	TLSAuthClientsRequired TLSAuthClients = "Required"
+	// TLSAuthClientsDisabled disables client certificate processing entirely.
+	// Maps to `tls-auth-clients no`.
+	TLSAuthClientsDisabled TLSAuthClients = "Disabled"
+)
+
+// TLSAuthClientsUser controls how Valkey maps an authenticated client
+// certificate to an ACL user. It mirrors the Valkey `tls-auth-clients-user` directive.
+// +kubebuilder:validation:Enum=CN;URI;Disabled
+type TLSAuthClientsUser string
+
+const (
+	// TLSAuthClientsUserCN maps the certificate's Common Name (CN) to an
+	// ACL username. Pair with `clientAuth.mode: Required` to enforce mTLS.
+	// Requires Valkey >= 9.0.
+	TLSAuthClientsUserCN TLSAuthClientsUser = "CN"
+	// TLSAuthClientsUserURI maps the first URI from the certificate's
+	// Subject Alternative Name (SAN) that matches a Valkey ACL username.
+	// Requires Valkey >= 9.1.
+	TLSAuthClientsUserURI TLSAuthClientsUser = "URI"
+	// TLSAuthClientsUserDisabled disables certificate-to-user mapping (default).
+	TLSAuthClientsUserDisabled TLSAuthClientsUser = "Disabled"
+)
+
+// TLSClientAuthSpec configures client certificate authentication for incoming
+// TLS connections.
+// +kubebuilder:validation:XValidation:rule="!(has(self.mode) && self.mode == 'Disabled' && has(self.certificateUser) && self.certificateUser != 'Disabled')",message="certificateUser has no effect when mode=Disabled: Valkey ignores client certificates in that mode"
+type TLSClientAuthSpec struct {
+	// Mode controls whether clients must authenticate with a TLS certificate.
+	// `Required` enforces mTLS, `Optional` allows both authenticated and
+	// unauthenticated clients, and `Disabled` turns client certificate processing
+	// off entirely.
+	// Defaults to `Optional`.
+	// +kubebuilder:default=Optional
+	// +optional
+	Mode TLSAuthClients `json:"mode,omitempty"`
+
+	// CertificateUser configures how Valkey maps an authenticated client
+	// certificate to an ACL user. Set to `CN` to use the certificate's Common Name
+	// (requires Valkey >= 9.0), or `URI` to use the first matching URI from the
+	// certificate's Subject Alternative Name (SAN) (requires Valkey >= 9.1).
+	// Defaults to `Disabled`, which leaves the directive unset.
+	// +kubebuilder:default=Disabled
+	// +optional
+	CertificateUser TLSAuthClientsUser `json:"certificateUser,omitempty"`
+}
+
+// EffectiveMode returns mode, defaulting to Optional when unset.
+func (s *TLSClientAuthSpec) EffectiveMode() TLSAuthClients {
+	if s == nil || s.Mode == "" {
+		return TLSAuthClientsOptional
+	}
+	return s.Mode
+}
+
+// EffectiveCertificateUser returns certificateUser, defaulting to Disabled when unset.
+func (s *TLSClientAuthSpec) EffectiveCertificateUser() TLSAuthClientsUser {
+	if s == nil || s.CertificateUser == "" {
+		return TLSAuthClientsUserDisabled
+	}
+	return s.CertificateUser
+}
+
+// TLSSpec defines the TLS configuration for ValkeyCluster.
+type TLSSpec struct {
+	// ServerName is the hostname used for TLS verification when the operator
+	// connects to a node by pod IP. When unset, the operator uses
+	// valkey-<name>.<namespace>.svc.<clusterDomain> (default cluster.local).
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:XValidation:rule="self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')",message="must be a valid DNS-1123 subdomain (lowercase alphanumerics, '-' and '.', starting and ending with an alphanumeric)"
+	ServerName string `json:"serverName,omitempty"`
+
+	// Certificates holds the certificate slots used by the cluster.
+	// +kubebuilder:validation:Required
+	Certificates TLSCertificates `json:"certificates"`
+
+	// ClientAuth configures client certificate authentication. When omitted,
+	// mode defaults to `Optional` and certificateUser defaults to `Disabled`.
+	// +optional
+	ClientAuth *TLSClientAuthSpec `json:"clientAuth,omitempty"`
+}
+
+// ClientAuthMode returns the effective client-auth mode for t.
+func (t *TLSSpec) ClientAuthMode() TLSAuthClients {
+	if t == nil {
+		return TLSAuthClientsOptional
+	}
+	return t.ClientAuth.EffectiveMode()
+}
+
+// ClientAuthCertificateUser returns the effective certificate-to-user mapping for t.
+func (t *TLSSpec) ClientAuthCertificateUser() TLSAuthClientsUser {
+	if t == nil {
+		return TLSAuthClientsUserDisabled
+	}
+	return t.ClientAuth.EffectiveCertificateUser()
+}
+
+// TLSCertificates groups the certificate slots for a ValkeyCluster. Today
+// `server` is the only slot; the trust-source, outbound-identity and
+// control-plane-identity slots land in later phases of #360.
+type TLSCertificates struct {
+	// Server is the node identity presented to clients and peers, and the
+	// trust root for the cluster. The referenced secret must contain:
 	//
 	// - `ca.crt`: The certificate authority.
 	// - `tls.crt`: The certificate (or a chain).
 	// - `tls.key`: The private key to the first certificate in the certificate chain.
 	// +kubebuilder:validation:Required
-	Certificate CertificateRef `json:"certificate"`
+	Server CertificateSource `json:"server"`
 }
 
 // GetTLS returns the cluster TLS config from spec.networking.tls, or nil.
-func (c *ValkeyCluster) GetTLS() *TLSConfig {
+func (c *ValkeyCluster) GetTLS() *TLSSpec {
 	if c == nil || c.Spec.Networking == nil {
 		return nil
 	}
 	return c.Spec.Networking.TLS
 }
 
-// CertificateRef defines the certificate reference for ValkeyCluster.
-type CertificateRef struct {
+// GetPreferredEndpointType returns discovery preferred endpoint type, default IP.
+func (c *ValkeyCluster) GetPreferredEndpointType() PreferredEndpointType {
+	if c == nil || c.Spec.Networking == nil || c.Spec.Networking.Discovery == nil ||
+		c.Spec.Networking.Discovery.PreferredEndpointType == "" {
+		return PreferredEndpointTypeIP
+	}
+	return c.Spec.Networking.Discovery.PreferredEndpointType
+}
+
+// GetClusterDomain returns networking.clusterDomain, default cluster.local.
+func (c *ValkeyCluster) GetClusterDomain() string {
+	if c == nil || c.Spec.Networking == nil || c.Spec.Networking.ClusterDomain == "" {
+		return DefaultClusterDomain
+	}
+	return c.Spec.Networking.ClusterDomain
+}
+
+// PrefersHostnameAnnounce reports whether discovery announces hostnames.
+func (c *ValkeyCluster) PrefersHostnameAnnounce() bool {
+	return c.GetPreferredEndpointType() == PreferredEndpointTypeHostname
+}
+
+// CertificateSource references a certificate and its private key. Today the
+// only source is a Secret; future sources (cert-manager, operator-generated)
+// are added as sibling fields forming a union where exactly one may be set.
+type CertificateSource struct {
 	// SecretName is the name of the secret.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
@@ -436,8 +629,11 @@ type ExporterSpec struct {
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 
-	// Enable or disable the exporter sidecar container
-	Enabled bool `json:"enabled,omitempty"`
+	// Enable or disable the exporter sidecar container. Unset means enabled
+	// on a ValkeyCluster; a ValkeyNode runs the sidecar only on an explicit
+	// true, which the cluster controller propagates when enabled.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
 
 	// Override the SecurityContext applied to the exporter sidecar container.
 	// +optional
@@ -446,6 +642,13 @@ type ExporterSpec struct {
 	// Additional cmdline arguments passed to exporter sidecar container.
 	// +optional
 	Args []string `json:"args,omitempty"`
+}
+
+// ExporterEnabled resolves the cluster-level default: a nil
+// spec.exporter.enabled means enabled, so overriding any other exporter
+// field keeps the sidecar.
+func (s ValkeyClusterSpec) ExporterEnabled() bool {
+	return s.Exporter.Enabled == nil || *s.Exporter.Enabled
 }
 
 // ValkeyClusterStatus defines the observed state of ValkeyCluster.
@@ -497,45 +700,72 @@ const (
 	// considers risky, for example a terminationGracePeriodSeconds too short for
 	// graceful failover.
 	ConditionConfigurationWarning = "ConfigurationWarning"
+	// ConditionTLSEndpointWarning flags TLS with IP announce (including default
+	// IP). Non-blocking: Ready may stay True. Prefer Hostname announce with DNS SANs.
+	ConditionTLSEndpointWarning = "TLSEndpointWarning"
 )
 
 const (
 	// Common reasons for conditions
-	ReasonInitializing             = "Initializing"
-	ReasonReconciling              = "Reconciling"
-	ReasonClusterHealthy           = "ClusterHealthy"
-	ReasonServiceError             = "ServiceError"
-	ReasonConfigMapError           = "ConfigMapError"
-	ReasonValkeyNodeError          = "ValkeyNodeError"
-	ReasonValkeyNodeListError      = "ValkeyNodeListError"
-	ReasonAddingNodes              = "AddingNodes"
-	ReasonNodeAddFailed            = "NodeAddFailed"
-	ReasonMissingShards            = "MissingShards"
-	ReasonMissingReplicas          = "MissingReplicas"
-	ReasonReconcileComplete        = "ReconcileComplete"
-	ReasonTopologyComplete         = "TopologyComplete"
-	ReasonAllSlotsAssigned         = "AllSlotsAssigned"
-	ReasonSlotsUnassigned          = "SlotsUnassigned"
-	ReasonGracePeriodTooShort      = "GracePeriodTooShort"
-	ReasonPrimaryLost              = "PrimaryLost"
-	ReasonNoSlots                  = "NoSlotsAvailable"
-	ReasonRebalancingSlots         = "RebalancingSlots"
-	ReasonRebalanceFailed          = "RebalanceFailed"
-	ReasonUsersAclError            = "UsersACLError"
-	ReasonUpdatingNodes            = "UpdatingNodes"
-	ReasonSystemUsersAclError      = "SystemUsersACLError"
-	ReasonPodDisruptionBudgetError = "PodDisruptionBudgetError"
-	ReasonPodUnschedulable         = "PodUnschedulable"
+	ReasonInitializing                  = "Initializing"
+	ReasonReconciling                   = "Reconciling"
+	ReasonClusterHealthy                = "ClusterHealthy"
+	ReasonServiceError                  = "ServiceError"
+	ReasonConfigMapError                = "ConfigMapError"
+	ReasonValkeyNodeError               = "ValkeyNodeError"
+	ReasonValkeyNodeListError           = "ValkeyNodeListError"
+	ReasonAddingNodes                   = "AddingNodes"
+	ReasonNodeAddFailed                 = "NodeAddFailed"
+	ReasonMissingShards                 = "MissingShards"
+	ReasonMissingReplicas               = "MissingReplicas"
+	ReasonReconcileComplete             = "ReconcileComplete"
+	ReasonTopologyComplete              = "TopologyComplete"
+	ReasonAllSlotsAssigned              = "AllSlotsAssigned"
+	ReasonSlotsUnassigned               = "SlotsUnassigned"
+	ReasonGracePeriodTooShort           = "GracePeriodTooShort"
+	ReasonPrimaryLost                   = "PrimaryLost"
+	ReasonNoSlots                       = "NoSlotsAvailable"
+	ReasonRebalancingSlots              = "RebalancingSlots"
+	ReasonRebalanceFailed               = "RebalanceFailed"
+	ReasonACLApplyFailed                = "ACLApplyFailed"
+	ReasonUsersAclError                 = "UsersACLError"
+	ReasonUpdatingNodes                 = "UpdatingNodes"
+	ReasonSystemUsersAclError           = "SystemUsersACLError"
+	ReasonPodDisruptionBudgetError      = "PodDisruptionBudgetError"
+	ReasonPodUnschedulable              = "PodUnschedulable"
+	ReasonUnsupportedConfigDirective    = "UnsupportedConfigDirective"
+	ReasonMultipleConfigurationWarnings = "MultipleConfigurationWarnings"
+	ReasonServiceAccountNotFound        = "ServiceAccountNotFound"
+	ReasonServiceAccountLookupFailed    = "ServiceAccountLookupFailed"
+	// ReasonTLSWithIPAnnounce is used with ConditionTLSEndpointWarning when TLS
+	// is enabled and preferred endpoint type is IP (default or explicit).
+	ReasonTLSWithIPAnnounce = "TLSWithIPAnnounce"
 )
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+//
+// The name rules below keep the longest derived workload name within what
+// Kubernetes accepts. Every ValkeyNode gets a workload named
+// valkey-<name>-<shard>-<node>. With workloadType StatefulSet, Kubernetes
+// stamps each pod with a controller-revision-hash label of the StatefulSet
+// name plus an 11-character suffix, and label values stop at 63 characters,
+// so a StatefulSet name longer than 52 never gets a pod. The rule counts the
+// digits of the highest shard index (shards - 1) and node index (replicas),
+// so a scale-out that pushes an index into more digits is rejected too. A
+// Deployment carries no such label; there the headless Service valkey-<name>,
+// a DNS label of at most 63 characters, is the limit, until the indexes grow
+// enough for the ValkeyNode name <name>-<shard>-<node>, which every pod
+// carries as its app.kubernetes.io/instance label value, to reach 63 first.
 
 // ValkeyCluster is the Schema for the valkeyclusters API
 // +kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.state",description="Current state of the cluster"
 // +kubebuilder:printcolumn:name="Reason",type="string",JSONPath=".status.reason",description="Reason for current state"
 // +kubebuilder:printcolumn:name="ReadyShards",type="integer",JSONPath=".status.readyShards",description="Ready shards",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time since creation"
+// +kubebuilder:validation:XValidation:rule="(has(self.spec.workloadType) && self.spec.workloadType == 'Deployment') || size(self.metadata.name) + size(string(self.spec.shards - 1)) + size(string(has(self.spec.replicas) ? self.spec.replicas : 0)) <= 43",message="metadata.name is too long: the StatefulSet name valkey-<name>-<shard>-<node> must stay within 52 characters, because Kubernetes appends an 11-character controller-revision-hash to it in a pod label limited to 63 characters"
+// +kubebuilder:validation:XValidation:rule="!(has(self.spec.workloadType) && self.spec.workloadType == 'Deployment') || size(self.metadata.name) <= 56",message="metadata.name is too long: the headless Service name valkey-<name> must stay within 63 characters"
+// +kubebuilder:validation:XValidation:rule="!(has(self.spec.workloadType) && self.spec.workloadType == 'Deployment') || size(self.metadata.name) + size(string(self.spec.shards - 1)) + size(string(has(self.spec.replicas) ? self.spec.replicas : 0)) <= 61",message="metadata.name is too long: the ValkeyNode name <name>-<shard>-<node> is the app.kubernetes.io/instance label value of its pod and must stay within 63 characters"
 type ValkeyCluster struct {
 	metav1.TypeMeta `json:",inline"`
 

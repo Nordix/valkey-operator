@@ -58,6 +58,7 @@ Common reasons when `Ready=False`:
 - `PodDisruptionBudgetError` – failed to create/update/delete the PodDisruptionBudget
 - `Reconciling` – controller is making changes
 - `UpdatingNodes` – rolling update of ValkeyNode CRs in progress
+  - while the roll of a shard's primary is on hold, because the shard has no synced replica to fail over to or the proactive failover to one did not complete, the message names the shard, the node and which of the two it is, for example `Updating ValkeyNodes: the roll of shard 2 primary valkey-c-2-0 is waiting, the shard has no synced replica to fail over to`. A healthy roll passes through this too, while the replica it rolled first does its initial sync, so the message says where a roll is, not that it is stuck. To catch a roll that runs too long, alert on `valkey_operator_cluster_state_info{state="Reconciling"} == 1` with a `for` clause of your choosing, and read the message for which shard to look at. A failed or timed-out failover also leaves a `FailoverFailed` or `FailoverTimeout` event
 - `MissingShards` – waiting for all shards to be created
 - `MissingReplicas` – waiting for all replicas to be created
 - `PodUnschedulable` – Kubernetes cannot schedule one or more Valkey pods
@@ -93,6 +94,7 @@ Common reasons:
 - `NodeAddFailed` – failed to add a node to the cluster
 - `RebalanceFailed` – slot rebalancing failed (scale-out or scale-in)
 - `PodUnschedulable` – Kubernetes scheduler cannot place one or more Valkey pods, for example because strict topology spread constraints cannot be satisfied
+- `ACLApplyFailed` – one or more nodes report `ACLApplied=False/ApplyFailed`, so the users declared in `spec.users` are not in effect on those nodes. See [`ACLApplied`](#aclapplied)
 
 ---
 
@@ -133,6 +135,21 @@ Indicates the operator accepted a spec value it considers risky, rather than rej
 
 Common reasons:
 - `GracePeriodTooShort` – `spec.terminationGracePeriodSeconds` is below the recommended minimum for the graceful failover on shutdown (`cluster-manual-failover-timeout` plus a buffer). The value is still applied.
+- `UnsupportedConfigDirective` – one or more user-set `spec.config` directives were dropped from the rendered `valkey.conf` because the operator could not determine the image version, or the detected Valkey version does not support them. The condition message names each directive, the minimum version, and the detected version or detection failure.
+- `ServiceAccountNotFound` – `spec.serviceAccountName` names a ServiceAccount that does not exist in the cluster namespace. Pod admission rejects each ValkeyNode pod until the ServiceAccount is created.
+- `ServiceAccountLookupFailed` – the operator could not verify that `spec.serviceAccountName` exists, for example because of a transient API error. This lookup is advisory; pod admission still enforces the ServiceAccount requirement.
+- `MultipleConfigurationWarnings` – more than one configuration warning is active at the same time. The controller combines them into a single `ConfigurationWarning` condition with this reason, and the message lists all active warnings. A `Warning` event is emitted for each warning, and the condition clears on the next reconcile once the offending input is no longer present.
+
+#### `TLSEndpointWarning`
+Non-blocking warning when TLS is enabled and discovery still uses IP announce (default or explicit `preferredEndpointType: IP`). `Ready` may stay `True`.
+
+| Status | Meaning |
+|---|---|
+| `True` | TLS is set and announce is IP; clients re-dialing pod IPs after `CLUSTER SLOTS` often fail certificate name checks. Prefer `networking.discovery.preferredEndpointType: Hostname` and DNS SANs for pod FQDNs. |
+| `False` (or absent) | No TLS, or Hostname announce is selected. |
+
+Common reasons:
+- `TLSWithIPAnnounce` – TLS with IP preferred endpoint type.
 
 ---
 
@@ -192,7 +209,7 @@ This condition is only set when the node is ready and there are allowlisted conf
 | `False` | `CONFIG SET` failed; the running config may not match `spec.config`. The cluster controller will not advance past this node until the condition is `True`. |
 
 Common reasons when `LiveConfigApplied=False`:
-- `ApplyFailed` – `CONFIG SET` returned an error (e.g. a permissions error or an invalid value). The message field contains the exact error.
+- `ApplyFailed` – `CONFIG SET` returned an error (e.g. a permissions error or an invalid value). The message field contains the current error, although the connection's local address (IP and port) may be from an earlier attempt.
 
 Common reasons when `LiveConfigApplied=True`:
 - `Applied` – Live config applied successfully.
@@ -206,19 +223,17 @@ This condition is set once the node is ready and mounts an ACL Secret. An edit r
 
 | Status | Meaning |
 |---|---|
-| `True` | The desired user set and their password hashes are live on the server. |
-| `False` | The reload ran but the running ACL does not yet match the desired users and passwords (for example the mounted aclfile has not refreshed yet), or the reload failed. |
+| `True` | The desired user set, their password hashes, and the current ACL revision are live on the server. |
+| `False` | The reload ran but the running ACL does not yet match the desired revision (for example the mounted aclfile has not refreshed yet), or the reload failed. |
 
 Common reasons when `ACLApplied=False`:
 - `PendingPropagation` – the reload read a stale mounted aclfile; the node retries until the projected volume catches up.
-- `ApplyFailed` – `ACL LOAD` or the follow-up read returned an error. The message field contains the exact error.
+- `ApplyFailed` – `ACL LOAD` or the follow-up read returned an error. The message field contains the current error, although the connection's local address (IP and port) may be from an earlier attempt.
 
 Common reasons when `ACLApplied=True`:
-- `Applied` – the desired users and passwords are live.
+- `Applied` – the desired ACL revision is live.
 
-> **Note:** `ACLApplied` compares the user set and password hashes exactly, which is what a password rotation waits on. It is informational and does not block the cluster controller's one-at-a-time progress. On a failed apply the node controller emits a `LiveACLApplyFailed` warning event and retries with backoff.
->
-> **Limitation:** Only the user set and password hashes drive the condition, so only those changes move it through `PendingPropagation` back to `True`: adding or removing a user or a password. A change to a user's `enabled` flag or permissions still takes effect on the server (the reload is unconditional), but the condition does not report a transient `PendingPropagation` for it, so it is not a signal to wait on for those fields. Comparing rules directly would mean reimplementing Valkey's normalized ACL rendering; making the condition track every field is left as a follow-up.
+> **Note:** The operator appends a disabled bookkeeping user, `_operator_acl_revision`, to the aclfile. Its only password is a hash of the whole managed ACL, so a node reports `ACLApplied=True` only once the running server has loaded that exact revision. This keeps the condition honest for permission-only edits, which leave every user and password unchanged but still change the revision hash. The user is disabled (`off`) and cannot authenticate; it is expected to appear in `ACL LIST`. The condition does not block the cluster controller's one-at-a-time progress, but a failure it cannot resolve is carried up: while any node reports `ApplyFailed`, the cluster sets [`Degraded`](#degraded) with reason `ACLApplyFailed` and a message naming the nodes, and `status.state` reports `Degraded` because it takes that condition ahead of `Ready`. `PendingPropagation` is deliberately not carried up, since it is the normal state after every ACL edit and clears itself once the mounted aclfile catches up. On a failed apply the node controller emits a `LiveACLApplyFailed` warning event and retries with backoff.
 
 #### `WorkloadRollPending`
 Indicates that a rolling pod-template update is intentionally deferred: the ValkeyNode controller has built a pod template that differs from the live StatefulSet or Deployment, but `spec.workloadRevision` has not yet authorized that template. This is expected staging while the cluster advances rolls one node at a time, not an error.
@@ -364,6 +379,7 @@ These events are emitted during cluster maintenance operations.
 |---|---|---|
 | `StaleNodeForgotten` | Normal | Stale node is forgotten from the cluster |
 | `NodeForgetFailed` | Warning | Forgetting a node fails |
+| `SupersededPodDeleted` | Normal | A pod that was not ready and left on a revision its StatefulSet had already superseded was deleted, so the corrected pod template could take effect |
 
 ### Status events
 

@@ -22,7 +22,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/client-go/tools/events"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -67,12 +66,16 @@ func findFailoverShard(state *valkey.ClusterState, address string) (*valkey.Shar
 	if primary == nil || primary.Address != address {
 		return nil, nil
 	}
-	replicas := shard.GetSyncedReplicas()
+	replicas := shard.GetSyncedReplicas(state)
 	if len(replicas) == 0 {
 		return nil, nil
 	}
 	return shard, replicas
 }
+
+// proactiveFailoverFn is what the roll calls; tests swap it for a stub, the
+// way nodeInfoFunc stands in for INFO in the node controller.
+var proactiveFailoverFn = proactiveFailover
 
 // proactiveFailover issues CLUSTER FAILOVER to the best synced replica in shard,
 // then polls until the replica reports role:master or the timeout is reached.
@@ -127,82 +130,44 @@ func proactiveFailover(ctx context.Context, recorder events.EventRecorder, clust
 	}
 }
 
-// nodeRequiresRoll returns true when the node has a running pod whose spec
-// differs from the desired spec, meaning a spec update will trigger a pod roll.
-func nodeRequiresRoll(current *valkeyiov1alpha1.ValkeyNode, desired *valkeyiov1alpha1.ValkeyNode) bool {
-	if current.Status.PodIP == "" {
-		return false
+// effectiveWorkloadType maps the empty WorkloadType to StatefulSet (the CRD
+// default), so ""→"StatefulSet" spec changes are not mistaken for a swap.
+func effectiveWorkloadType(t valkeyiov1alpha1.WorkloadType) valkeyiov1alpha1.WorkloadType {
+	if t == "" {
+		return valkeyiov1alpha1.WorkloadTypeStatefulSet
 	}
-	// Config changes are applied live via CONFIG SET (see applyLiveConfig) and
-	// must not trigger a roll; the roll-relevant config subset is already
-	// captured by Spec.ServerConfigHash.
-	currentSpec, desiredSpec := current.Spec, desired.Spec
-	currentSpec.Config, desiredSpec.Config = nil, nil
-	return !equality.Semantic.DeepEqual(currentSpec, desiredSpec)
+	return t
 }
 
 // needsProactiveFailoverForRoll reports whether a Spec update should run
 // proactive failover before applying.
 //
-// liveTemplateHash is podTemplateRollHash of the live StatefulSet/Deployment
-// template (empty if unknown). When only WorkloadRevision differs and the
-// current revision is empty, we treat it as bookkeeping only if live already
-// matches the authorized hash; otherwise (e.g. ACL annotation changed before
-// the field was ever set) it is a real pod roll.
+// A pod roll is decided by the rendered template, not the spec encoding:
+// desired.Spec.WorkloadRevision already holds podTemplateRollHash of the
+// desired template (see setDesiredWorkloadRevision), and liveTemplateHash is
+// the same hash of the live StatefulSet/Deployment template (empty when the
+// workload does not exist). Changes to Spec that render the same template
+// therefore never fail over. An empty liveTemplateHash on a node that still
+// records a pod IP means the workload was deleted, usually orphaned with its
+// pod left running; the pod's template is unknown, so any revision change
+// counts as a roll. The recorded IP can be stale, but then the failover finds
+// no primary at that address and does nothing. Config never enters the decision
+// directly: live-settable keys are applied via CONFIG SET (see applyLiveConfig)
+// and the roll-relevant subset reaches the template as a derived annotation
+// (see buildPodTemplateAnnotations), so it is captured by the hashes.
 func needsProactiveFailoverForRoll(current, desired *valkeyiov1alpha1.ValkeyNode, liveTemplateHash string) bool {
-	if !nodeRequiresRoll(current, desired) {
+	if current.Status.PodIP == "" {
 		return false
 	}
-	// Other Spec fields differ (image, config hash, resources, …): real roll.
-	c, d := current.Spec, desired.Spec
-	c.WorkloadRevision, d.WorkloadRevision = "", ""
-	c.Config, d.Config = nil, nil
-	if !equality.Semantic.DeepEqual(c, d) {
+	// A StatefulSet↔Deployment swap replaces pods even when both kinds render
+	// an identical template.
+	if effectiveWorkloadType(current.Spec.WorkloadType) != effectiveWorkloadType(desired.Spec.WorkloadType) {
 		return true
 	}
-	// Only WorkloadRevision differs.
-	if current.Spec.WorkloadRevision != "" {
-		// Non-empty A -> B: Spec authorizes a new template.
+	if liveTemplateHash == "" {
+		// No workload but a recorded pod IP: recreating the workload with a
+		// new revision can replace a pod it orphaned.
 		return current.Spec.WorkloadRevision != desired.Spec.WorkloadRevision
 	}
-	// Empty current revision: skip failover only when live already matches
-	// the template we are about to authorize (pure backfill).
-	if liveTemplateHash != "" && liveTemplateHash == desired.Spec.WorkloadRevision {
-		return false
-	}
-	// Live unknown or differs (ACL/builder change concurrent with first backfill).
-	return true
-}
-
-// anyNodeRequiresFailoverAwareRoll is true when at least one node needs a Spec
-// update that should scrape live topology for proactive failover / replica-first
-// primary placement. Pure WorkloadRevision backfill (live template already
-// matches) does not qualify.
-//
-// liveTemplateHashes maps ValkeyNode name -> hash of live pod template.
-func anyNodeRequiresFailoverAwareRoll(cluster *valkeyiov1alpha1.ValkeyCluster, nodeList *valkeyiov1alpha1.ValkeyNodeList, configHash string, liveTemplateHashes map[string]string) bool {
-	byName := make(map[string]*valkeyiov1alpha1.ValkeyNode, len(nodeList.Items))
-	for i := range nodeList.Items {
-		byName[nodeList.Items[i].Name] = &nodeList.Items[i]
-	}
-	nodesPerShard := 1 + int(cluster.Spec.Replicas)
-	for shardIndex := range int(cluster.Spec.Shards) {
-		for nodeIndex := range nodesPerShard {
-			desired := buildClusterValkeyNode(cluster, shardIndex, nodeIndex)
-			desired.Spec.ServerConfigHash = configHash
-			if err := setDesiredWorkloadRevision(desired); err != nil {
-				return true
-			}
-			if current, ok := byName[desired.Name]; ok {
-				liveHash := ""
-				if liveTemplateHashes != nil {
-					liveHash = liveTemplateHashes[desired.Name]
-				}
-				if needsProactiveFailoverForRoll(current, desired, liveHash) {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return liveTemplateHash != desired.Spec.WorkloadRevision
 }

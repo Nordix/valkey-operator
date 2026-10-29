@@ -96,13 +96,6 @@ type ValkeyNodeSpec struct {
 	// +optional
 	ServerConfigMapName string `json:"serverConfigMapName,omitempty"`
 
-	// ServerConfigHash is a hash of the server ConfigMap contents. When set by
-	// the ValkeyCluster controller it bumps the spec Generation, which triggers
-	// the ValkeyNode controller to reconcile and update the pod template
-	// annotation — causing a rolling restart when the cluster config changes.
-	// +optional
-	ServerConfigHash string `json:"serverConfigHash,omitempty"`
-
 	// UsersACLSecretName is the name of the Secret containing the ACL user
 	// file. When set, mounts a users-acl volume from this Secret so the
 	// container can load aclfile /config/users/users.acl.
@@ -117,7 +110,7 @@ type ValkeyNodeSpec struct {
 
 	// TLS configuration for the node
 	// +optional
-	TLS *TLSConfig `json:"tls,omitempty"`
+	TLS *NodeTLSSpec `json:"tls,omitempty"`
 
 	// Config is the user-facing Valkey configuration, copied verbatim from the
 	// owning cluster's Spec.Config. The controller applies the subset of these
@@ -130,6 +123,18 @@ type ValkeyNodeSpec struct {
 	// When set, this overrides the default PodSecurityContext.
 	// +optional
 	PodSecurityContext *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
+
+	// ServiceAccountName is the name of the Kubernetes ServiceAccount used by
+	// the ValkeyNode pod.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+
+	// PodMetadata adds labels and annotations to the ValkeyNode pod.
+	// +optional
+	PodMetadata *EmbeddedObjectMetadata `json:"podMetadata,omitempty"`
 
 	// TerminationGracePeriodSeconds is the pod termination grace period, set by
 	// the ValkeyCluster controller so the graceful CLUSTER FAILOVER on SIGTERM
@@ -146,6 +151,91 @@ type ValkeyNodeSpec struct {
 	// the field and apply immediately.
 	// +optional
 	WorkloadRevision string `json:"workloadRevision,omitempty"`
+
+	// PreferredEndpointType is set by the ValkeyCluster controller from
+	// spec.networking.discovery. PreferredEndpointTypeHostname switches announce
+	// flags and managed config to hostname mode. Standalone nodes leave this empty
+	// (IP announce).
+	// +kubebuilder:validation:Enum=IP;Hostname
+	// +optional
+	PreferredEndpointType PreferredEndpointType `json:"preferredEndpointType,omitempty"`
+
+	// ClusterDomain is set by the ValkeyCluster controller from
+	// spec.networking.clusterDomain for TLS ServerName and Hostname FQDNs.
+	// +optional
+	ClusterDomain string `json:"clusterDomain,omitempty"`
+}
+
+// NodeTLSSpec is the node's own TLS API. It deliberately does not reuse the
+// ValkeyCluster TLSSpec: the cluster API expresses user intent whereas this
+// API is the resolved view the node controller renders into valkey.conf and
+// volume mounts.
+type NodeTLSSpec struct {
+	// ServerName is the hostname used for TLS verification when connecting
+	// to the pod IP. For cluster-owned nodes this is
+	// spec.networking.tls.serverName, or
+	// valkey-<cluster>.<ns>.svc.<clusterDomain> if that is unset. When this
+	// field is empty on a node with the valkey.io/cluster label, the node
+	// controller verifies against that default name.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:XValidation:rule="self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')",message="must be a valid DNS-1123 subdomain (lowercase alphanumerics, '-' and '.', starting and ending with an alphanumeric)"
+	ServerName string `json:"serverName,omitempty"`
+
+	// Certificates holds the certificate slots mounted into the node pod.
+	// +kubebuilder:validation:Required
+	Certificates NodeTLSCertificates `json:"certificates"`
+
+	// ClientAuth is the resolved client certificate authentication settings
+	// rendered into `tls-auth-clients` and `tls-auth-clients-user`. For
+	// cluster-owned nodes the ValkeyCluster controller copies
+	// spec.networking.tls.clientAuth here.
+	// +optional
+	ClientAuth *TLSClientAuthSpec `json:"clientAuth,omitempty"`
+}
+
+// ClientAuthMode returns the effective client-auth mode for t.
+func (t *NodeTLSSpec) ClientAuthMode() TLSAuthClients {
+	if t == nil {
+		return TLSAuthClientsOptional
+	}
+	return t.ClientAuth.EffectiveMode()
+}
+
+// ClientAuthCertificateUser returns the effective certificate-to-user mapping for t.
+func (t *NodeTLSSpec) ClientAuthCertificateUser() TLSAuthClientsUser {
+	if t == nil {
+		return TLSAuthClientsUserDisabled
+	}
+	return t.ClientAuth.EffectiveCertificateUser()
+}
+
+// RequiresClientCertificate reports whether TLS clients must present a certificate.
+func (t *NodeTLSSpec) RequiresClientCertificate() bool {
+	return t.ClientAuthMode() == TLSAuthClientsRequired
+}
+
+// NodeTLSCertificates groups the certificate slots for a ValkeyNode.
+type NodeTLSCertificates struct {
+	// Server is the node identity presented to clients and peers, and the
+	// trust root for the node. The referenced secret must contain `ca.crt`,
+	// `tls.crt` and `tls.key`.
+	// +kubebuilder:validation:Required
+	Server NodeCertificateRef `json:"server"`
+}
+
+// NodeCertificateRef references a certificate and its private key held in a
+// Secret. It is deliberately a ref and not a source: the cluster-level
+// CertificateSource is a union that grows a cert-manager arm, whereas the
+// ValkeyCluster controller resolves any such source to a Secret before writing
+// the ValkeyNode, so this side only ever names something the node can mount.
+type NodeCertificateRef struct {
+	// SecretName is the name of the secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	SecretName string `json:"secretName"`
 }
 
 // ValkeyNodeStatus defines the observed state of ValkeyNode.
@@ -193,8 +283,19 @@ const (
 	// ValkeyNodeConditionACLApplied indicates that the ACL the cluster controller
 	// wrote to the mounted Secret is live on the server. It is applied via ACL
 	// LOAD without a pod roll, so ACL never enters Spec.WorkloadRevision. True
-	// means the desired user set and their password hashes are live.
+	// means the desired user set, their password hashes, and the current ACL
+	// revision are live, confirmed by a bookkeeping revision user whose password
+	// is a hash of the managed ACL (see aclRevisionUser); permission-only
+	// edits are therefore honoured too.
 	ValkeyNodeConditionACLApplied = "ACLApplied"
+	// ValkeyNodeReasonApplied, ValkeyNodeReasonPendingPropagation and
+	// ValkeyNodeReasonApplyFailed are the reasons ACLApplied and
+	// LiveConfigApplied carry. The distinction matters to anything aggregating
+	// them: propagation is the normal state after an edit and clears itself once
+	// the mounted file catches up, while a failed apply does not clear on its own.
+	ValkeyNodeReasonApplied            = "Applied"
+	ValkeyNodeReasonPendingPropagation = "PendingPropagation"
+	ValkeyNodeReasonApplyFailed        = "ApplyFailed"
 	// ValkeyNodeConditionWorkloadRollPending indicates a rolling pod-template update
 	// is intentionally deferred: the desired template differs from live, and
 	// Spec.WorkloadRevision has not yet authorized that template. Status True means

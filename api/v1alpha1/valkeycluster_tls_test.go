@@ -47,12 +47,40 @@ func TestGetTLS(t *testing.T) {
 		c := &ValkeyCluster{
 			Spec: ValkeyClusterSpec{
 				Networking: &NetworkingSpec{
-					TLS: &TLSConfig{Certificate: CertificateRef{SecretName: "net-tls"}},
+					TLS: &TLSSpec{
+						Certificates: TLSCertificates{
+							Server: CertificateSource{SecretName: "net-tls"},
+						},
+					},
 				},
 			},
 		}
 		tls := c.GetTLS()
 		require.NotNil(t, tls)
-		assert.Equal(t, "net-tls", tls.Certificate.SecretName)
+		assert.Equal(t, "net-tls", tls.Certificates.Server.SecretName)
+	})
+}
+
+func TestGetPreferredEndpointTypeAndClusterDomain(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		c := &ValkeyCluster{}
+		assert.Equal(t, PreferredEndpointTypeIP, c.GetPreferredEndpointType())
+		assert.Equal(t, DefaultClusterDomain, c.GetClusterDomain())
+		assert.False(t, c.PrefersHostnameAnnounce())
+	})
+	t.Run("hostname and custom domain", func(t *testing.T) {
+		c := &ValkeyCluster{
+			Spec: ValkeyClusterSpec{
+				Networking: &NetworkingSpec{
+					ClusterDomain: "corp.local",
+					Discovery: &DiscoverySpec{
+						PreferredEndpointType: PreferredEndpointTypeHostname,
+					},
+				},
+			},
+		}
+		assert.Equal(t, PreferredEndpointTypeHostname, c.GetPreferredEndpointType())
+		assert.Equal(t, "corp.local", c.GetClusterDomain())
+		assert.True(t, c.PrefersHostnameAnnounce())
 	})
 }
