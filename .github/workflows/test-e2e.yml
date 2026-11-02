@@ -2,8 +2,6 @@ name: E2E Tests
 
 on:
   push:
-    branches:
-      - 'main'
   pull_request:
 
 permissions:
@@ -51,7 +49,7 @@ jobs:
 
       # Build the image once and provide it to the matrix jobs as an artifact.
       - name: Build operator image
-        run: make docker-build IMG="$MANAGER_IMAGE"
+        run: FORCE FAIL make docker-build IMG="$MANAGER_IMAGE"
 
       - name: Save operator image to tarball
         run: docker save "$MANAGER_IMAGE" -o /tmp/operator-image.tar

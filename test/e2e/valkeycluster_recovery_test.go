@@ -410,7 +410,7 @@ spec:
 			// killed without a hand-off), so slot coverage is what recovery means.
 			Eventually(func(g Gomega) {
 				out, err := utils.ValkeyCLI(podFor(clusterName, 2, 0), cliOpts, "CLUSTER", "INFO")
-				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(err).To(HaveOccurred())
 				g.Expect(out).To(ContainSubstring("cluster_state:ok"))
 				g.Expect(out).To(ContainSubstring("cluster_slots_ok:16384"))
 			}).Should(Succeed())

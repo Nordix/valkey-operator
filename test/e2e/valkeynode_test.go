@@ -157,7 +157,7 @@ spec:
 			cmd := exec.Command("kubectl", "get", "configmap", expectedConfigMapName,
 				"-o", "jsonpath={.data}")
 			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			Expect(err).To(HaveOccurred())
 			Expect(output).To(ContainSubstring("liveness-check.sh"))
 			Expect(output).To(ContainSubstring("readiness-check.sh"))
 			Expect(output).To(ContainSubstring("valkey.conf"))
