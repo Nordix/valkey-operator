@@ -17,12 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1592,7 +1594,16 @@ func runProbeScript(t *testing.T, scriptPath, response string, hang bool) error 
 		cmd = exec.Command(scriptPath)
 	}
 	cmd.Env = append(os.Environ(), env...)
-	return cmd.Run()
+	// In a pod, valkey-server is PID 1 and reaps no orphans, so anything the
+	// script leaves running ends as a zombie there. Its own process group
+	// must therefore be empty once the script has exited.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	err := cmd.Run()
+	if killErr := syscall.Kill(-cmd.Process.Pid, 0); !errors.Is(killErr, syscall.ESRCH) {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		t.Errorf("processes started by %s still run after it exited", scriptPath)
+	}
+	return err
 }
 
 func TestBuildValkeyNodePodTemplateSpec_OperatorUserProbeEnv(t *testing.T) {

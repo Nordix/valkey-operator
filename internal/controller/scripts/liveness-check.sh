@@ -17,13 +17,24 @@ timeout_cmd() {
     duration=$1; shift
     "$@" &
     cmdpid=$!
+    # Every process here is waited for by its parent: valkey-server runs as
+    # PID 1 and does not reap orphans, so each one left would stay a zombie.
     # The watchdog must not hold the caller's stdout, or $(...) waits for it.
-    (sleep "$duration"; kill -TERM "$cmdpid" 2>/dev/null; sleep 1
-     kill -KILL "$cmdpid" 2>/dev/null) >/dev/null 2>&1 &
+    (
+        sleeper=
+        trap 'kill "$sleeper" 2>/dev/null; wait; exit 0' TERM
+        sleep "$duration" & sleeper=$!
+        wait "$sleeper"
+        kill -TERM "$cmdpid" 2>/dev/null
+        sleep 1 & sleeper=$!
+        wait "$sleeper"
+        kill -KILL "$cmdpid" 2>/dev/null
+    ) >/dev/null 2>&1 &
     watchdog=$!
     rc=0
     wait "$cmdpid" || rc=$?
     kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
     # Killed by the watchdog's SIGTERM (143) or SIGKILL (137).
     if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
         return 124
