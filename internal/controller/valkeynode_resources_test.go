@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/moby/patternmatcher"
 	"github.com/moby/patternmatcher/ignorefile"
@@ -1298,21 +1299,40 @@ func TestLivenessCheckScript(t *testing.T) {
 	tests := []struct {
 		name     string
 		response string
+		hang     bool
 		wantErr  bool
 	}{
 		{name: "pong", response: "PONG", wantErr: false},
 		{name: "loading", response: "LOADING 123", wantErr: false},
+		{name: "loading, multi-line", response: "LOADING 123\nmore", wantErr: false},
 		{name: "masterdown", response: "MASTERDOWN Link with MASTER is down", wantErr: false},
 		{name: "error", response: "ERR something bad", wantErr: true},
+		{name: "hang", hang: true, wantErr: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := runProbeScript(t, scriptPath, test.response); (err != nil) != test.wantErr {
+			start := time.Now()
+			err := runProbeScript(t, scriptPath, test.response, test.hang)
+			if (err != nil) != test.wantErr {
 				t.Fatalf("unexpected result: err=%v wantErr=%v", err, test.wantErr)
 			}
+			assertProbeTimedOut(t, test.hang, err, time.Since(start))
 		})
 	}
+}
+
+// assertProbeTimedOut checks that a hung valkey-cli ends the probe with exit
+// code 124 at the 1s timeout, without waiting for valkey-cli.
+func assertProbeTimedOut(t *testing.T, hang bool, err error, took time.Duration) {
+	t.Helper()
+	if !hang {
+		return
+	}
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr)
+	assert.Equal(t, 124, exitErr.ExitCode())
+	assert.Less(t, took, 5*time.Second)
 }
 
 func TestReadinessCheckScript(t *testing.T) {
@@ -1321,19 +1341,24 @@ func TestReadinessCheckScript(t *testing.T) {
 	tests := []struct {
 		name     string
 		response string
+		hang     bool
 		wantErr  bool
 	}{
 		{name: "pong", response: "PONG", wantErr: false},
 		{name: "loading", response: "LOADING 123", wantErr: true},
 		{name: "masterdown", response: "MASTERDOWN Link with MASTER is down", wantErr: true},
 		{name: "error", response: "ERR something bad", wantErr: true},
+		{name: "hang", hang: true, wantErr: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := runProbeScript(t, scriptPath, test.response); (err != nil) != test.wantErr {
+			start := time.Now()
+			err := runProbeScript(t, scriptPath, test.response, test.hang)
+			if (err != nil) != test.wantErr {
 				t.Fatalf("unexpected result: err=%v wantErr=%v", err, test.wantErr)
 			}
+			assertProbeTimedOut(t, test.hang, err, time.Since(start))
 		})
 	}
 }
@@ -1541,23 +1566,32 @@ func TestBuildValkeyNodePodTemplateSpec_ImagePullSecrets(t *testing.T) {
 	assert.Equal(t, node.Spec.ImagePullSecrets, pts.Spec.ImagePullSecrets, "ImagePullSecrets should be set on pod spec")
 }
 
-func runProbeScript(t *testing.T, scriptPath, response string) error {
+func runProbeScript(t *testing.T, scriptPath, response string, hang bool) error {
 	t.Helper()
 
 	// Stub valkey-cli so the script uses the response we provide.
 	binDir := t.TempDir()
 	valkeyCli := filepath.Join(binDir, "valkey-cli")
+	// exec, so the probe's signal reaches the hanging process itself, as it
+	// would a hung valkey-cli.
 	script := []byte("#!/bin/sh\n" +
+		"[ -n \"$VALKEY_HANG\" ] && exec sleep 30\n" +
 		"echo \"${VALKEY_RESPONSE:-PONG}\"\n")
 	if err := os.WriteFile(valkeyCli, script, 0o755); err != nil {
 		t.Fatalf("write valkey-cli stub: %v", err)
 	}
 
-	cmd := exec.Command(scriptPath)
-	cmd.Env = append(os.Environ(),
-		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"VALKEY_RESPONSE="+response,
-	)
+	// A hang is tested with a 1s timeout.
+	var cmd *exec.Cmd
+	env := []string{"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"VALKEY_RESPONSE=" + response}
+	if hang {
+		cmd = exec.Command(scriptPath, "1")
+		env = append(env, "VALKEY_HANG=1")
+	} else {
+		cmd = exec.Command(scriptPath)
+	}
+	cmd.Env = append(os.Environ(), env...)
 	return cmd.Run()
 }
 

@@ -9,31 +9,26 @@ set -e
 timeout=${1:-"4"}
 port=${2:-"6379"}
 
-# Run a command with a DURATION (seconds) timeout. Polls every 0.1s; on timeout
-# sends SIGTERM then SIGKILL. Returns the command's exit code, or 124 on timeout.
+# Run a command with a DURATION (seconds) timeout. A watchdog sends SIGTERM on
+# timeout, then SIGKILL a second later. Returns the command's exit code, or 124
+# on timeout. It starts one sleep however long the command takes, so a slow host
+# does not make each probe start more processes.
 timeout_cmd() {
     duration=$1; shift
     "$@" &
     cmdpid=$!
-
-	# Poll every 0.1 seconds
-    count=0
-    max_count=$((duration * 10))
-    while [ $count -lt $max_count ]; do
-        if ! kill -0 $cmdpid 2>/dev/null; then
-            wait $cmdpid
-            return $?
-        fi
-        sleep 0.1
-        count=$((count + 1))
-    done
-
-    # Timeout reached
-    kill -TERM $cmdpid 2>/dev/null
-    sleep 0.1
-    kill -0 $cmdpid 2>/dev/null && sleep 1 && kill -KILL $cmdpid 2>/dev/null
-    wait $cmdpid 2>/dev/null
-    return 124
+    # The watchdog must not hold the caller's stdout, or $(...) waits for it.
+    (sleep "$duration"; kill -TERM "$cmdpid" 2>/dev/null; sleep 1
+     kill -KILL "$cmdpid" 2>/dev/null) >/dev/null 2>&1 &
+    watchdog=$!
+    rc=0
+    wait "$cmdpid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true
+    # Killed by the watchdog's SIGTERM (143) or SIGKILL (137).
+    if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then
+        return 124
+    fi
+    return "$rc"
 }
 
 # Build TLS args from environment variables if set
@@ -53,7 +48,10 @@ response=$(
     timeout_cmd $timeout \
     valkey-cli -h localhost -p $port $tls_args $auth_args PING)
 
-responseFirstWord=$(echo "$response" | head -n1 | awk '{print $1;}')
+nl='
+'
+firstLine=${response%%"$nl"*}
+responseFirstWord=${firstLine%% *}
 if [ "$response" != "PONG" ] && [ "$responseFirstWord" != "LOADING" ] && [ "$responseFirstWord" != "MASTERDOWN" ]; then
     echo "$response" >&2
     exit 1
