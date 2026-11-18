@@ -30,6 +30,11 @@ import (
 // Slot fields, when present, start at index clusterNodesMinFields.
 const clusterNodesMinFields = 8
 
+// clusterNodesPreallocMax bounds the entries ParseClusterNodes reserves up front.
+// The reserve is sized from the number of newlines, which a reply that is not
+// CLUSTER NODES output can make far larger than the number of entries.
+const clusterNodesPreallocMax = 4096
+
 // SlotMigration is one in-flight slot handoff from a CLUSTER NODES line.
 // Peer is the other end of the handoff: the node the slot is moving to for a
 // migrating marker, and the node it is coming from for an importing marker.
@@ -116,7 +121,11 @@ func FindMyself(nodes []ClusterNode) *ClusterNode {
 // Lines with fewer than clusterNodesMinFields fields are skipped, which covers
 // the trailing empty line and any partial output.
 func ParseClusterNodes(raw string) []ClusterNode {
-	var nodes []ClusterNode
+	// One entry per line at most. Every scraped node parses a table of the whole
+	// cluster, so growing the slice by append would allocate about twice the
+	// final size on each of those scrapes. A larger table than the reserve still
+	// parses; it grows by append.
+	nodes := make([]ClusterNode, 0, min(strings.Count(raw, "\n")+1, clusterNodesPreallocMax))
 	for line := range strings.SplitSeq(raw, "\n") {
 		if node, ok := parseClusterNodesLine(line); ok {
 			nodes = append(nodes, node)
