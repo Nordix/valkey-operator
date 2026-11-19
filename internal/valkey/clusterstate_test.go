@@ -47,44 +47,12 @@ func TestParseSlotsRange(t *testing.T) {
 	if slots != expect {
 		t.Errorf("Expected %v, got %v", expect, slots)
 	}
-}
 
-func TestParseSlotsRanges(t *testing.T) {
-	ranges, err := parseSlotsRanges([]string{"0-5460", "5461-10922", "10923-16383"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	expected := []SlotsRange{{0, 5460}, {5461, 10922}, {10923, 16383}}
-	if !reflect.DeepEqual(ranges, expected) {
-		t.Errorf("expected %v, got %v", expected, ranges)
-	}
-
-	// Migrating/importing entries from CLUSTER NODES should be skipped.
-	ranges, err = parseSlotsRanges([]string{"0-5460", "[5461->-abc123]", "[5462-<-def456]"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	expected = []SlotsRange{{0, 5460}}
-	if !reflect.DeepEqual(ranges, expected) {
-		t.Errorf("expected %v, got %v", expected, ranges)
-	}
-
-	// Empty input.
-	ranges, err = parseSlotsRanges([]string{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(ranges) != 0 {
-		t.Errorf("expected empty, got %v", ranges)
-	}
-
-	// Only migration entries — should return empty.
-	ranges, err = parseSlotsRanges([]string{"[5461->-abc123]"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(ranges) != 0 {
-		t.Errorf("expected empty, got %v", ranges)
+	// Not a slot or a range
+	for _, bad := range []string{"", "x", "-5", "5-", "1-2-3", "9-3", "0--0"} {
+		if _, err := parseSlotsRange(bad); err == nil {
+			t.Errorf("Expected an error for %q", bad)
+		}
 	}
 }
 
@@ -175,32 +143,32 @@ func TestShardState_GetSyncedReplicas(t *testing.T) {
 	// The one primary owning slots reports cluster_size 1, so its own
 	// report is the whole quorum.
 	primary := &NodeState{
-		Id:          "primary-id",
-		Address:     "10.0.0.1",
-		Flags:       []string{"myself", "master"},
-		Info:        map[string]string{"role": "master"},
-		ClusterInfo: map[string]string{"cluster_size": "1"},
+		Id:              "primary-id",
+		Address:         "10.0.0.1",
+		Flags:           []string{"myself", "master"},
+		ReplicationInfo: map[string]string{"role": "master"},
+		ClusterInfo:     map[string]string{"cluster_size": "1"},
 	}
 	syncedReplica := &NodeState{
-		Id:      "replica-1-id",
-		Address: "10.0.0.2",
-		Flags:   []string{"slave"},
-		Info:    map[string]string{"role": "slave", "master_link_status": "up"},
+		Id:              "replica-1-id",
+		Address:         "10.0.0.2",
+		Flags:           []string{"slave"},
+		ReplicationInfo: map[string]string{"role": "slave", "master_link_status": "up"},
 	}
 	unsyncedReplica := &NodeState{
-		Id:      "replica-2-id",
-		Address: "10.0.0.3",
-		Flags:   []string{"slave"},
-		Info:    map[string]string{"role": "slave", "master_link_status": "down"},
+		Id:              "replica-2-id",
+		Address:         "10.0.0.3",
+		Flags:           []string{"slave"},
+		ReplicationInfo: map[string]string{"role": "slave", "master_link_status": "down"},
 	}
 	// A replica whose own scrape looks healthy: its link is up and its own
 	// CLUSTER NODES entry, like every node's own entry, carries no failure
 	// flag. Only the primary's view of the cluster says it is failing.
 	partitionedReplica := &NodeState{
-		Id:      "replica-3-id",
-		Address: "10.0.0.4",
-		Flags:   []string{"slave"},
-		Info:    map[string]string{"role": "slave", "master_link_status": "up"},
+		Id:              "replica-3-id",
+		Address:         "10.0.0.4",
+		Flags:           []string{"slave"},
+		ReplicationInfo: map[string]string{"role": "slave", "master_link_status": "up"},
 	}
 	primary.nodes = ParseClusterNodes("primary-id 10.0.0.1:6379@16379 myself,master - 0 0 1 connected 0-5461\n" +
 		"replica-1-id 10.0.0.2:6379@16379 slave primary-id 0 0 1 connected\n" +
@@ -226,10 +194,10 @@ func TestShardState_GetSyncedReplicas(t *testing.T) {
 
 func TestShardState_GetSyncedReplicas_Empty(t *testing.T) {
 	primary := &NodeState{
-		Id:      "primary-id",
-		Address: "10.0.0.1",
-		Flags:   []string{"myself", "master"},
-		Info:    map[string]string{"role": "master"},
+		Id:              "primary-id",
+		Address:         "10.0.0.1",
+		Flags:           []string{"myself", "master"},
+		ReplicationInfo: map[string]string{"role": "master"},
 	}
 	shard := &ShardState{
 		Id:        "shard-0",
@@ -449,9 +417,9 @@ func TestClusterState_BestReplicaOf(t *testing.T) {
 				PrimaryId: "primary1",
 				Nodes: []*NodeState{
 					{Id: "primary1", Flags: []string{"master"}, nodes: ParseClusterNodes("primary1 10.0.0.1:6379@16379 myself,master - 0 0 1 connected 0-5461\n")},
-					{Id: "r1", Flags: []string{"slave"}, Info: map[string]string{"slave_repl_offset": "100"}, nodes: ParseClusterNodes("r1 10.0.0.2:6379@16379 myself,slave primary1 0 0 1 connected\n")},
-					{Id: "r2", Flags: []string{"slave"}, Info: map[string]string{"slave_repl_offset": "500"}, nodes: ParseClusterNodes("r2 10.0.0.3:6379@16379 myself,slave primary1 0 0 1 connected\n")},
-					{Id: "r3", Flags: []string{"slave"}, Info: map[string]string{"slave_repl_offset": "200"}, nodes: ParseClusterNodes("r3 10.0.0.4:6379@16379 myself,slave primary1 0 0 1 connected\n")},
+					{Id: "r1", Flags: []string{"slave"}, ReplicationInfo: map[string]string{"slave_repl_offset": "100"}, nodes: ParseClusterNodes("r1 10.0.0.2:6379@16379 myself,slave primary1 0 0 1 connected\n")},
+					{Id: "r2", Flags: []string{"slave"}, ReplicationInfo: map[string]string{"slave_repl_offset": "500"}, nodes: ParseClusterNodes("r2 10.0.0.3:6379@16379 myself,slave primary1 0 0 1 connected\n")},
+					{Id: "r3", Flags: []string{"slave"}, ReplicationInfo: map[string]string{"slave_repl_offset": "200"}, nodes: ParseClusterNodes("r3 10.0.0.4:6379@16379 myself,slave primary1 0 0 1 connected\n")},
 				},
 			},
 		},
@@ -478,7 +446,7 @@ func TestHighestOffsetReplica(t *testing.T) {
 		if offset != "" {
 			info["slave_repl_offset"] = offset
 		}
-		return &NodeState{Id: id, Info: info}
+		return &NodeState{Id: id, ReplicationInfo: info}
 	}
 
 	t.Run("nil for no replicas", func(t *testing.T) {
@@ -1041,10 +1009,10 @@ func TestClusterState_IsNodeFailedByMajority(t *testing.T) {
 // A node cut off from the cluster bus marks every peer fail? in its own
 // table. That one opinion must not empty the failover target list.
 func TestShardState_GetSyncedReplicas_PartitionedPeerDoesNotExcludeEveryone(t *testing.T) {
-	primary := &NodeState{Id: "p", Flags: []string{"myself", "master"}, Info: map[string]string{"role": "master"},
+	primary := &NodeState{Id: "p", Flags: []string{"myself", "master"}, ReplicationInfo: map[string]string{"role": "master"},
 		ClusterInfo: map[string]string{"cluster_size": "1"}}
-	r1 := &NodeState{Id: "r1", Flags: []string{"slave"}, Info: map[string]string{"role": "slave", "master_link_status": "up"}}
-	r2 := &NodeState{Id: "r2", Flags: []string{"slave"}, Info: map[string]string{"role": "slave", "master_link_status": "up"}}
+	r1 := &NodeState{Id: "r1", Flags: []string{"slave"}, ReplicationInfo: map[string]string{"role": "slave", "master_link_status": "up"}}
+	r2 := &NodeState{Id: "r2", Flags: []string{"slave"}, ReplicationInfo: map[string]string{"role": "slave", "master_link_status": "up"}}
 	primary.nodes = ParseClusterNodes("p 10.0.0.1:6379@16379 myself,master - 0 0 1 connected 0-16383\nr1 10.0.0.2:6379@16379 slave p 0 0 1 connected\nr2 10.0.0.3:6379@16379 slave p 0 0 1 connected\n")
 	r1.nodes = ParseClusterNodes("p 10.0.0.1:6379@16379 master - 0 0 1 connected 0-16383\nr1 10.0.0.2:6379@16379 myself,slave p 0 0 1 connected\nr2 10.0.0.3:6379@16379 slave p 0 0 1 connected\n")
 	// r2 is cut off and sees everyone as fail?.
@@ -1103,7 +1071,10 @@ func TestGetClusterStateSkipsAStaleClientThatFailsTheRoundTrip(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	stale := vmock.NewClient(ctrl)
 	stale.EXPECT().
-		DoMulti(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoMulti(gomock.Any(),
+			vmock.Match("CLUSTER", "MYID"), vmock.Match("CLUSTER", "MYSHARDID"),
+			vmock.Match("INFO", "replication"), vmock.Match("CLUSTER", "INFO"),
+			vmock.Match("CLUSTER", "NODES")).
 		Return([]vclient.ValkeyResult{vmock.ErrorResult(errors.New("io: read/write on closed pipe"))})
 
 	dial := func(_ context.Context, _ string) (vclient.Client, error) {
